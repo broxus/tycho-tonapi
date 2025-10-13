@@ -1,0 +1,40 @@
+[package]
+name = "tycho-tonapi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89.0"
+
+[dependencies]
+ahash = "0.8.12"
+anyhow = "1"
+arc-swap = "1.7.1"
+bytes = "1.10.1"
+castaway = "0.2.4"
+clap = { version = "4.5.48", features = ["derive"] }
+moka = { version = "0.12", features = ["sync"] }
+prost = "0.14.1"
+scopeguard = "1.2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-stream = "0.1.17"
+tonic = { version = "0.14", features = ["server"] }
+tonic-prost = "0.14.2"
+tracing = "0.1.41"
+
+tikv-jemallocator = { version = "0.6.0", features = [
+    "unprefixed_malloc_on_supported_platforms",
+    "background_threads",
+    "profiling",
+] }
+
+tycho-block-util = { version = "0.3.2" }
+tycho-core = { version = "0.3.2" }
+tycho-storage = { version = "0.3.2" }
+tycho-types = { version = "0.3.0", features = ["sync", "base64", "models", "tycho", "rand9"] }
+tycho-util = { version = "0.3.2", features = ["cli"] }
+
+[build-dependencies]
+anyhow = "1"
+tonic-prost-build = "*"
