@@ -7,6 +7,7 @@ fn main() -> Result<()> {
         .build_client(false)
         .build_server(true)
         .bytes(".indexer.LibraryCellFound.cell")
+        .bytes(".indexer.BlockChunk.data")
         .compile_protos(&["proto/indexer.proto"], &["proto"])?;
 
     let app_version = env("CARGO_PKG_VERSION")?;

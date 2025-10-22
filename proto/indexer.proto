@@ -69,22 +69,14 @@ message NewMasterchainBlock {
     repeated BlockId shardBlockIds = 3;
 }
 
-message BlockId {
-    int32 workchain = 1;
-    uint64 shard = 2;
-    uint32 seqno = 3;
-    bytes rootHash = 4;
-    bytes fileHash = 5;
-}
-
 // === Get block ===
 
 message GetBlockRequest {
     oneof query {
         // Searches for a block by seqno.
         BlockBySeqno bySeqno = 1;
-        // Searches for a block by root hash (id).
-        BlockByRootHash byRootHash = 2;
+        // Searches for a block by its id.
+        BlockId byId = 2;
     }
 }
 
@@ -97,16 +89,6 @@ message GetBlockResponse {
         // Subsequent messages in stream if it didn't fit into one chunk.
         BlockChunk chunk = 3;
     }
-}
-
-message BlockBySeqno {
-    int32 workchain = 1;
-    uint64 shard = 2;
-    uint32 seqno = 3;
-}
-
-message BlockByRootHash {
-    bytes rootHash = 1;
 }
 
 message BlockNotFound {
@@ -140,8 +122,8 @@ message GetShardAccountRequest {
         NullValue latest = 4;
         // Searches for a block by seqno.
         BlockBySeqno bySeqno = 5;
-        // Searches for a block by root hash (id).
-        BlockByRootHash byRootHash = 6;
+        // Searches for a block by its id.
+        BlockById byId = 6;
     }
 }
 
@@ -206,6 +188,24 @@ message McStateInfo {
     uint64 lt = 2;
     // Masterchain unix timestamp.
     uint32 utime = 3;
+}
+
+message BlockBySeqno {
+    int32 workchain = 1;
+    uint64 shard = 2;
+    uint32 seqno = 3;
+}
+
+message BlockById {
+    BlockId id = 1;
+}
+
+message BlockId {
+    int32 workchain = 1;
+    uint64 shard = 2;
+    uint32 seqno = 3;
+    bytes rootHash = 4;
+    bytes fileHash = 5;
 }
 
 enum NullValue { NULL_VALUE = 0; }

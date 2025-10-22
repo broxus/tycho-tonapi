@@ -127,7 +127,7 @@ impl Cmd {
         let _grpc_task = {
             use tycho_tonapi::grpc;
 
-            let server_impl = grpc::GrpcServer::new(state);
+            let server_impl = grpc::GrpcServer::new(state.clone());
             let server = tonic::transport::Server::builder()
                 .add_service(grpc::proto::tycho_indexer_server::TychoIndexerServer::new(
                     server_impl,
@@ -149,6 +149,12 @@ impl Cmd {
         node.update_validator_set_from_shard_state(&init_block_id)
             .await?;
 
+        // Finish app state initialization.
+        state
+            .init(&init_block_id)
+            .await
+            .context("failed to init app state")?;
+
         // Build strider.
         let archive_block_provider = node.build_archive_block_provider();
         let storage_block_provider = node.build_storage_block_provider();
@@ -161,7 +167,7 @@ impl Cmd {
         let block_strider = node.build_strider(
             archive_block_provider.chain((blockchain_block_provider, storage_block_provider)),
             (
-                ShardStateApplier::new(node.core_storage.clone(), ps_subscriber),
+                ShardStateApplier::new(node.core_storage.clone(), (state, ps_subscriber)),
                 node.validator_resolver().clone(),
                 MetricsSubscriber,
             )
