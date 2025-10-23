@@ -18,7 +18,7 @@ use tycho_storage::kv::NamedTables;
 use tycho_types::models::{BlockId, BlockIdShort, DepthBalanceInfo, LibDescr, ShardAccount};
 use tycho_types::prelude::*;
 use tycho_util::FastHasherState;
-use weedb::rocksdb;
+use weedb::{OwnedSnapshot, rocksdb};
 
 use crate::db::{TonApiDb, TonApiTables, tables};
 
@@ -61,6 +61,7 @@ impl AppState {
                 block_data_chunk_size: config.block_data_chunk_size.as_u64(),
                 download_block_semaphore: Arc::new(Semaphore::new(config.max_concurrent_downloads)),
                 db,
+                db_snapshot: Default::default(),
             }),
         })
     }
@@ -92,16 +93,21 @@ impl AppState {
         let handles = this.storage.block_handle_storage();
         let blocks = this.storage.block_storage();
 
-        let handle = match query {
-            QueryBlock::BySeqno(_) => {
-                // TODO: Support
-                return Err(StateError::Internal(anyhow::anyhow!("not supported")));
-            }
-            QueryBlock::ById(block_id) => handles.load_handle(block_id),
-        };
-
         let stream = 'stream: {
-            let handle = match handle {
+            let block_id = match query {
+                QueryBlock::BySeqno(short_id) => {
+                    let Some(block_id) = self
+                        .find_block_id_by_seqno(short_id)
+                        .map_err(StateError::Internal)?
+                    else {
+                        break 'stream None;
+                    };
+                    block_id
+                }
+                QueryBlock::ById(block_id) => *block_id,
+            };
+
+            let handle = match handles.load_handle(&block_id) {
                 Some(handle) if handle.has_data() => handle,
                 // Early exit of no data found.
                 _ => break 'stream None,
@@ -128,7 +134,7 @@ impl AppState {
             Some(Box::new(BlockDataStream {
                 total_size: data.len() as u64,
                 chunk_size: this.block_data_chunk_size,
-                block_id: *handle.id(),
+                block_id,
                 data,
                 offset: 0,
                 _permit: permit,
@@ -158,6 +164,33 @@ impl AppState {
         }
 
         Ok(WithMcStateInfo::new(state.mc_state_info, lib))
+    }
+
+    // ===
+
+    fn find_block_id_by_seqno(&self, short_id: &BlockIdShort) -> Result<Option<BlockId>> {
+        let this = self.inner.as_ref();
+
+        let Ok::<i8, _>(workchain) = short_id.shard.workchain().try_into() else {
+            return Ok(None);
+        };
+
+        let mut key = [0; tables::KnownBlocks::KEY_LEN];
+        key[0] = workchain as u8;
+        key[1..9].copy_from_slice(&short_id.shard.prefix().to_be_bytes());
+        key[9..13].copy_from_slice(&short_id.seqno.to_be_bytes());
+
+        let Some(value) = this.db.known_blocks.get(key)? else {
+            return Ok(None);
+        };
+        let value = value.as_ref();
+
+        Ok(Some(BlockId {
+            shard: short_id.shard,
+            seqno: short_id.seqno,
+            root_hash: HashBytes::from_slice(&value[0..32]),
+            file_hash: HashBytes::from_slice(&value[32..64]),
+        }))
     }
 }
 
@@ -325,6 +358,7 @@ struct Inner {
     block_data_chunk_size: u64,
     download_block_semaphore: Arc<Semaphore>,
     db: TonApiDb,
+    db_snapshot: ArcSwapOption<OwnedSnapshot>,
 }
 
 #[derive(Clone)]
