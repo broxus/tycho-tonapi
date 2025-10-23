@@ -1,6 +1,7 @@
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
+use futures_util::StreamExt;
 use tokio_stream::Stream;
 use tycho_types::cell::HashBytes;
 use tycho_types::models::{BlockIdShort, ShardIdent};
@@ -30,16 +31,28 @@ impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
 
     async fn get_status(
         &self,
-        _request: tonic::Request<proto::GetStatusRequest>,
+        _: tonic::Request<proto::GetStatusRequest>,
     ) -> tonic::Result<tonic::Response<proto::GetStatusResponse>> {
-        todo!()
+        let status = self.state.get_status();
+        Ok(tonic::Response::new(proto::GetStatusResponse {
+            mc_state_info: status.mc_state_info.map(Into::into),
+            timestamp: status.timestamp,
+            zerostate_root_hash: status.zerostate_id.root_hash.as_slice().to_vec(),
+            zerostate_file_hash: status.zerostate_id.file_hash.as_slice().to_vec(),
+            init_block_seqno: status.init_block_seqno,
+        }))
     }
 
     async fn watch_block_ids(
         &self,
         request: tonic::Request<proto::WatchBlockIdsRequest>,
     ) -> tonic::Result<tonic::Response<Self::WatchBlockIdsStream>> {
-        todo!()
+        // TODO: Use seqno from request
+
+        let res = self.state.watch_new_blocks().await?;
+        Ok(tonic::Response::new(WatchBlockIdsStream {
+            inner: res.data,
+        }))
     }
 
     async fn get_block(
@@ -94,13 +107,39 @@ impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
 
 // === Streams ===
 
-pub struct WatchBlockIdsStream {}
+pub struct WatchBlockIdsStream {
+    inner: crate::state::NewBlocksStream,
+}
 
 impl tokio_stream::Stream for WatchBlockIdsStream {
     type Item = tonic::Result<proto::WatchBlockIdsEvent>;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        todo!()
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        use self::proto::watch_block_ids_event::Event;
+        use crate::state::NewBlocksStreamItem;
+
+        let Some(item) = ready!(self.inner.poll_next_unpin(cx)) else {
+            return Poll::Ready(None);
+        };
+
+        let event = match item {
+            NewBlocksStreamItem::NewMcBlock(item) => {
+                Event::NewMcBlock(proto::NewMasterchainBlock {
+                    mc_state_info: Some(item.mc_state_info.into()),
+                    mc_block_id: Some(item.mc_block_id.into()),
+                    shard_block_ids: item.shard_block_ids.iter().map(Into::into).collect(),
+                })
+            }
+            NewBlocksStreamItem::RangeSkipped(item) => {
+                Event::RangeSkipped(proto::BlocksRangeSkipped {
+                    mc_state_info: Some(item.mc_state_info.into()),
+                    from: item.from,
+                    to: item.to,
+                })
+            }
+        };
+
+        Poll::Ready(Some(Ok(proto::WatchBlockIdsEvent { event: Some(event) })))
     }
 }
 
@@ -267,6 +306,25 @@ impl TryFrom<&proto::get_block_request::Query> for crate::state::QueryBlock {
                 seqno: q.seqno,
             })),
             proto::get_block_request::Query::ById(q) => q.try_into().map(Self::ById),
+        }
+    }
+}
+
+impl From<tycho_types::models::BlockId> for proto::BlockId {
+    #[inline]
+    fn from(value: tycho_types::models::BlockId) -> Self {
+        Self::from(&value)
+    }
+}
+
+impl From<&tycho_types::models::BlockId> for proto::BlockId {
+    fn from(value: &tycho_types::models::BlockId) -> Self {
+        Self {
+            workchain: value.shard.workchain(),
+            shard: value.shard.prefix(),
+            seqno: value.seqno,
+            root_hash: value.root_hash.as_slice().to_vec(),
+            file_hash: value.file_hash.as_slice().to_vec(),
         }
     }
 }

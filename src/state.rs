@@ -1,18 +1,21 @@
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result};
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use bytesize::ByteSize;
+use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 use tokio_stream::Stream;
+use tokio_stream::wrappers::BroadcastStream;
 use tycho_block_util::state::ShardStateStuff;
 use tycho_core::block_strider::{BlockSubscriber, BlockSubscriberContext, StateSubscriber};
+use tycho_core::global_config::ZerostateId;
 use tycho_core::storage::CoreStorage;
 use tycho_storage::kv::NamedTables;
 use tycho_types::models::{BlockId, BlockIdShort, DepthBalanceInfo, LibDescr, ShardAccount};
@@ -28,6 +31,8 @@ pub struct AppStateConfig {
     pub libs_cache_capacity: u64,
     pub block_data_chunk_size: ByteSize,
     pub max_concurrent_downloads: usize,
+    pub max_subscriptions: usize,
+    pub events_buffer_size: usize,
 }
 
 impl Default for AppStateConfig {
@@ -36,6 +41,8 @@ impl Default for AppStateConfig {
             libs_cache_capacity: 100,
             block_data_chunk_size: ByteSize::mib(1),
             max_concurrent_downloads: 1000,
+            max_subscriptions: 10000,
+            events_buffer_size: 50,
         }
     }
 }
@@ -47,8 +54,14 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(storage: CoreStorage, config: AppStateConfig) -> Result<Self> {
+    pub fn new(
+        storage: CoreStorage,
+        zerostate_id: ZerostateId,
+        config: AppStateConfig,
+    ) -> Result<Self> {
         let db = storage.context().open_preconfigured(TonApiTables::NAME)?;
+
+        let (new_mc_block_events, _) = broadcast::channel(config.events_buffer_size);
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -60,35 +73,92 @@ impl AppState {
                 latest_mc_state: Default::default(),
                 block_data_chunk_size: config.block_data_chunk_size.as_u64(),
                 download_block_semaphore: Arc::new(Semaphore::new(config.max_concurrent_downloads)),
+                subscriptions_semaphore: Arc::new(Semaphore::new(config.max_subscriptions)),
                 db,
                 db_snapshot: Default::default(),
+                intermediate_block_ids: Default::default(),
+                new_mc_block_events,
+                zerostate_id,
+                init_block_seqno: AtomicU32::new(u32::MAX),
             }),
         })
     }
 
-    pub async fn init(&self, _init_block_id: &BlockId) -> Result<()> {
-        self.inner.is_ready.store(true, Ordering::Release);
+    pub async fn init(&self, _latest_block_id: &BlockId) -> Result<()> {
+        let this = self.inner.as_ref();
+        let init_block_id = this
+            .storage
+            .node_state()
+            .load_init_mc_block_id()
+            .context("core storage left uninitialized")?;
+
+        this.init_block_seqno
+            .store(init_block_id.seqno, Ordering::Release);
+
+        // TODO: Preload the initial blocks edge.
+
+        this.is_ready.store(true, Ordering::Release);
         tracing::info!("app state is ready");
         Ok(())
+    }
+
+    pub fn get_status(&self) -> AppStatus {
+        let this = self.inner.as_ref();
+        AppStatus {
+            mc_state_info: if self.is_ready() {
+                this.latest_mc_state
+                    .load()
+                    .as_ref()
+                    .map(|x| x.mc_state_info)
+            } else {
+                None
+            },
+            timestamp: tycho_util::time::now_millis(),
+            zerostate_id: this.zerostate_id,
+            init_block_seqno: this.init_block_seqno.load(Ordering::Acquire),
+        }
     }
 
     pub fn is_ready(&self) -> bool {
         self.inner.is_ready.load(Ordering::Acquire)
     }
 
-    pub async fn get_block(&self, query: &QueryBlock) -> StateResult<Option<Box<BlockDataStream>>> {
-        let this = self.inner.as_ref();
-        let mc_state_info = if self.is_ready()
-            && let Some(mc_state_info) = this
+    fn load_mc_state_info(&self) -> Result<McStateInfo, StateError> {
+        let latest_mc_state = if self.is_ready() {
+            self.inner
                 .latest_mc_state
                 .load()
                 .as_ref()
                 .map(|x| x.mc_state_info)
-        {
-            mc_state_info
         } else {
-            return Err(StateError::NotReady);
+            None
         };
+
+        latest_mc_state.ok_or(StateError::NotReady)
+    }
+
+    pub async fn watch_new_blocks(&self) -> StateResult<NewBlocksStream> {
+        let this = self.inner.as_ref();
+        let mc_state_info = self.load_mc_state_info()?;
+
+        let permit = this
+            .subscriptions_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| StateError::Internal(anyhow::anyhow!("subscription semaphore dropped")))?;
+
+        let new_blocks = self.inner.new_mc_block_events.subscribe();
+        Ok(WithMcStateInfo::new(mc_state_info, NewBlocksStream {
+            inner: self.inner.clone(),
+            new_blocks: BroadcastStream::new(new_blocks),
+            _permit: permit,
+        }))
+    }
+
+    pub async fn get_block(&self, query: &QueryBlock) -> StateResult<Option<Box<BlockDataStream>>> {
+        let this = self.inner.as_ref();
+        let mc_state_info = self.load_mc_state_info()?;
 
         let handles = this.storage.block_handle_storage();
         let blocks = this.storage.block_storage();
@@ -304,10 +374,19 @@ impl BlockSubscriber for AppState {
 
     fn handle_block<'a>(
         &'a self,
-        _cx: &'a BlockSubscriberContext,
+        cx: &'a BlockSubscriberContext,
         prepared: Self::Prepared,
     ) -> Self::HandleBlockFut<'a> {
         Box::pin(async move {
+            if !cx.block.id().is_masterchain() {
+                let mut intermediate = self.inner.intermediate_block_ids.lock().unwrap();
+                if intermediate.ref_by_mc_seqno != cx.mc_block_id.seqno {
+                    intermediate.ref_by_mc_seqno = cx.mc_block_id.seqno;
+                    intermediate.shard_block_ids.clear();
+                }
+                intermediate.shard_block_ids.push(*cx.block.id());
+            }
+
             prepared.await?.context("failed to store block metadata")?;
 
             Ok(())
@@ -323,7 +402,10 @@ impl StateSubscriber for AppState {
         cx: &'a tycho_core::block_strider::StateSubscriberContext,
     ) -> Self::HandleStateFut<'a> {
         Box::pin(async move {
-            if !cx.block.id().is_masterchain() {
+            let this = self.inner.as_ref();
+
+            let block_id = cx.block.id();
+            if !block_id.is_masterchain() {
                 // TODO: Handle shard blocks as well
                 return Ok(());
             }
@@ -338,13 +420,36 @@ impl StateSubscriber for AppState {
                 utime: state.gen_utime,
             };
 
-            self.inner.latest_mc_state.store(Some(Arc::new(CachedState {
+            this.latest_mc_state.store(Some(Arc::new(CachedState {
                 state: cx.state.clone(),
                 libraries,
                 accounts,
                 mc_state_info,
             })));
 
+            // Update DB snapshot only after masterchain block has beed processed.
+            this.db_snapshot
+                .store(Some(Arc::new(this.db.owned_snapshot())));
+
+            // Send new block event.
+            let shard_block_ids = {
+                let mut intermediate = this.intermediate_block_ids.lock().unwrap();
+                if intermediate.ref_by_mc_seqno == block_id.seqno {
+                    std::mem::take(&mut intermediate.shard_block_ids)
+                } else {
+                    intermediate.shard_block_ids.clear();
+                    Vec::new()
+                }
+            };
+            this.new_mc_block_events
+                .send(Arc::new(NewMasterchainBlock {
+                    mc_state_info,
+                    mc_block_id: *block_id,
+                    shard_block_ids,
+                }))
+                .ok();
+
+            // Done
             Ok(())
         })
     }
@@ -357,8 +462,13 @@ struct Inner {
     latest_mc_state: ArcSwapOption<CachedState>,
     block_data_chunk_size: u64,
     download_block_semaphore: Arc<Semaphore>,
+    subscriptions_semaphore: Arc<Semaphore>,
     db: TonApiDb,
     db_snapshot: ArcSwapOption<OwnedSnapshot>,
+    intermediate_block_ids: Mutex<ShardBlockIds>,
+    new_mc_block_events: broadcast::Sender<Arc<NewMasterchainBlock>>,
+    zerostate_id: ZerostateId,
+    init_block_seqno: AtomicU32,
 }
 
 #[derive(Clone)]
@@ -367,6 +477,12 @@ struct CachedState {
     libraries: Dict<HashBytes, LibDescr>,
     accounts: ShardAccountsDict,
     mc_state_info: McStateInfo,
+}
+
+#[derive(Default)]
+struct ShardBlockIds {
+    ref_by_mc_seqno: u32,
+    shard_block_ids: Vec<BlockId>,
 }
 
 type ShardAccountsDict = Dict<HashBytes, (DepthBalanceInfo, ShardAccount)>;
@@ -386,11 +502,33 @@ impl<T> WithMcStateInfo<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
+pub struct AppStatus {
+    pub mc_state_info: Option<McStateInfo>,
+    pub timestamp: u64,
+    pub zerostate_id: ZerostateId,
+    pub init_block_seqno: u32,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
 pub struct McStateInfo {
     pub mc_seqno: u32,
     pub lt: u64,
     pub utime: u32,
+}
+
+#[derive(Debug)]
+pub struct NewMasterchainBlock {
+    pub mc_state_info: McStateInfo,
+    pub mc_block_id: BlockId,
+    pub shard_block_ids: Vec<BlockId>,
+}
+
+#[derive(Debug)]
+pub struct SkippedBlocksRange {
+    pub mc_state_info: McStateInfo,
+    pub from: u32,
+    pub to: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -404,6 +542,42 @@ pub enum AtBlock {
 pub enum QueryBlock {
     BySeqno(BlockIdShort),
     ById(BlockId),
+}
+
+pub enum NewBlocksStreamItem {
+    NewMcBlock(Arc<NewMasterchainBlock>),
+    RangeSkipped(SkippedBlocksRange),
+}
+
+pub struct NewBlocksStream {
+    inner: Arc<Inner>,
+    new_blocks: BroadcastStream<Arc<NewMasterchainBlock>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Stream for NewBlocksStream {
+    type Item = NewBlocksStreamItem;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+
+        loop {
+            match self.new_blocks.poll_next_unpin(cx) {
+                // New event without lagging.
+                Poll::Ready(Some(Ok(item))) => {
+                    return Poll::Ready(Some(NewBlocksStreamItem::NewMcBlock(item)));
+                }
+                // Some blocks were skipped, we need to load them from DB or send a "skipped" event.
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {
+                    // TODO: Load from db.
+                    continue;
+                }
+                // Should not really happen
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
 }
 
 pub struct BlockDataStream {

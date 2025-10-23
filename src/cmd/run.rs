@@ -121,7 +121,11 @@ impl Cmd {
             .init_blockchain_rpc(NoopBroadcastListener, NoopBroadcastListener)?
             .build()?;
 
-        let state = AppState::new(node.core_storage.clone(), node_config.app)?;
+        let state = AppState::new(
+            node.core_storage.clone(),
+            global_config.zerostate,
+            node_config.app,
+        )?;
 
         // Bind gRPC
         let _grpc_task = {
