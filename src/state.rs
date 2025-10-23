@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -12,11 +12,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_stream::Stream;
 use tycho_block_util::state::ShardStateStuff;
-use tycho_core::block_strider::StateSubscriber;
+use tycho_core::block_strider::{BlockSubscriber, BlockSubscriberContext, StateSubscriber};
 use tycho_core::storage::CoreStorage;
+use tycho_storage::kv::NamedTables;
 use tycho_types::models::{BlockId, BlockIdShort, DepthBalanceInfo, LibDescr, ShardAccount};
 use tycho_types::prelude::*;
 use tycho_util::FastHasherState;
+use weedb::rocksdb;
+
+use crate::db::{TonApiDb, TonApiTables, tables};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -43,8 +47,10 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(storage: CoreStorage, config: AppStateConfig) -> Self {
-        Self {
+    pub fn new(storage: CoreStorage, config: AppStateConfig) -> Result<Self> {
+        let db = storage.context().open_preconfigured(TonApiTables::NAME)?;
+
+        Ok(Self {
             inner: Arc::new(Inner {
                 is_ready: AtomicBool::new(false),
                 storage,
@@ -54,8 +60,9 @@ impl AppState {
                 latest_mc_state: Default::default(),
                 block_data_chunk_size: config.block_data_chunk_size.as_u64(),
                 download_block_semaphore: Arc::new(Semaphore::new(config.max_concurrent_downloads)),
+                db,
             }),
-        }
+        })
     }
 
     pub async fn init(&self, _init_block_id: &BlockId) -> Result<()> {
@@ -154,6 +161,127 @@ impl AppState {
     }
 }
 
+impl BlockSubscriber for AppState {
+    type Prepared = tokio::task::JoinHandle<Result<()>>;
+    type PrepareBlockFut<'a> = futures_util::future::Ready<Result<Self::Prepared>>;
+    type HandleBlockFut<'a> = BoxFuture<'a, Result<()>>;
+
+    fn prepare_block<'a>(&'a self, cx: &'a BlockSubscriberContext) -> Self::PrepareBlockFut<'a> {
+        struct LatestBlockInfo {
+            id: BlockId,
+            start_lt: u64,
+            end_lt: u64,
+        }
+
+        let block_id = *cx.block.id();
+        let mc_seqno = cx.mc_block_id.seqno;
+
+        // TODO: Fill from either archive data or load from disk. However, it may not be
+        //       even needed, because we can read it from the compressed data.
+        let raw_data_size = 0u64;
+
+        let block = cx.block.clone();
+        let db = self.inner.db.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            // Skip unusual workchains
+            let Ok::<i8, _>(workchain) = block_id.shard.workchain().try_into() else {
+                return Ok(());
+            };
+
+            let info = block.load_info()?;
+
+            let shard_hashes = block_id
+                .is_masterchain()
+                .then(|| {
+                    let custom = block.load_custom()?;
+                    let mut shards = Vec::new();
+                    for entry in custom.shards.iter() {
+                        let (shard, descr) = entry?;
+                        if i8::try_from(shard.workchain()).is_err() {
+                            continue;
+                        }
+
+                        shards.push(LatestBlockInfo {
+                            id: BlockId {
+                                shard,
+                                seqno: descr.seqno,
+                                root_hash: descr.root_hash,
+                                file_hash: descr.file_hash,
+                            },
+                            start_lt: descr.start_lt,
+                            end_lt: descr.end_lt,
+                        })
+                    }
+                    Ok::<_, anyhow::Error>(shards)
+                })
+                .transpose()?;
+
+            let mut batch = rocksdb::WriteBatch::default();
+
+            // Prepare common key
+            let mut key = [0; tables::BlocksByMcSeqno::KEY_LEN];
+            key[0..4].copy_from_slice(&mc_seqno.to_be_bytes());
+            key[4] = workchain as u8;
+            key[5..13].copy_from_slice(&block_id.shard.prefix().to_be_bytes());
+            key[13..17].copy_from_slice(&block_id.seqno.to_be_bytes());
+
+            // Reserve value buffer
+            let mut value = Vec::<u8>::with_capacity(256);
+
+            // Fill known_blocks entry
+            value.extend_from_slice(block_id.root_hash.as_array());
+            value.extend_from_slice(block_id.file_hash.as_array());
+            value.extend_from_slice(&mc_seqno.to_le_bytes());
+            value.extend_from_slice(&raw_data_size.to_le_bytes());
+            // TODO: Build state proof
+
+            batch.put_cf(&db.known_blocks.cf(), &key[4..], &value);
+
+            // Fill blocks_by_mc_seqno entry
+            value.clear();
+            value.extend_from_slice(block_id.root_hash.as_array());
+            value.extend_from_slice(block_id.file_hash.as_array());
+            value.extend_from_slice(&info.start_lt.to_le_bytes());
+            value.extend_from_slice(&info.end_lt.to_le_bytes());
+            if let Some(shard_hashes) = &shard_hashes {
+                value.extend_from_slice(&(shard_hashes.len() as u32).to_le_bytes());
+                for item in shard_hashes {
+                    value.push(item.id.shard.workchain() as i8 as u8);
+                    value.extend_from_slice(&item.id.shard.prefix().to_le_bytes());
+                    value.extend_from_slice(&item.id.seqno.to_le_bytes());
+                    value.extend_from_slice(item.id.root_hash.as_array());
+                    value.extend_from_slice(item.id.file_hash.as_array());
+                    value.extend_from_slice(&item.start_lt.to_le_bytes());
+                    value.extend_from_slice(&item.end_lt.to_le_bytes());
+                }
+            }
+
+            batch.put_cf(&db.blocks_by_mc_seqno.cf(), key.as_slice(), value);
+
+            // Write batch
+            db.rocksdb()
+                .write_opt(batch, db.known_blocks.write_config())?;
+
+            // Done
+            Ok::<_, anyhow::Error>(())
+        });
+
+        futures_util::future::ready(Ok(handle))
+    }
+
+    fn handle_block<'a>(
+        &'a self,
+        _cx: &'a BlockSubscriberContext,
+        prepared: Self::Prepared,
+    ) -> Self::HandleBlockFut<'a> {
+        Box::pin(async move {
+            prepared.await?.context("failed to store block metadata")?;
+
+            Ok(())
+        })
+    }
+}
+
 impl StateSubscriber for AppState {
     type HandleStateFut<'a> = BoxFuture<'a, Result<()>>;
 
@@ -196,6 +324,7 @@ struct Inner {
     latest_mc_state: ArcSwapOption<CachedState>,
     block_data_chunk_size: u64,
     download_block_semaphore: Arc<Semaphore>,
+    db: TonApiDb,
 }
 
 #[derive(Clone)]

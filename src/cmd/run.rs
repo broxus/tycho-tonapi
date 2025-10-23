@@ -121,7 +121,7 @@ impl Cmd {
             .init_blockchain_rpc(NoopBroadcastListener, NoopBroadcastListener)?
             .build()?;
 
-        let state = AppState::new(node.core_storage.clone(), node_config.app);
+        let state = AppState::new(node.core_storage.clone(), node_config.app)?;
 
         // Bind gRPC
         let _grpc_task = {
@@ -167,6 +167,7 @@ impl Cmd {
         let block_strider = node.build_strider(
             archive_block_provider.chain((blockchain_block_provider, storage_block_provider)),
             (
+                state.clone(),
                 ShardStateApplier::new(node.core_storage.clone(), (state, ps_subscriber)),
                 node.validator_resolver().clone(),
                 MetricsSubscriber,

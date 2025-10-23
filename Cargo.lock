@@ -793,6 +793,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f29059c0c2090612e8d742178b0580d2dc940c837851ad723096f87af6663e"
 
 [[package]]
+name = "futures-executor"
+version = "0.3.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e28d1d997f585e54aebc3f97d39e72338912123a67330d723fdbb564d646c9f"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-io"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2954,9 +2965,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tycho-block-util"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ccb3aff5c4d73ed821239537a683abc8a98921994efba0cb8c8bdbf7bbf937c"
+checksum = "29f03ab1bf69d28ef59689f1282535660f0744fd0523ab496c7cc55caba5879b"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2974,9 +2985,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-core"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74f5de15111b3c25bb180df325f26a2d4b7136b1c028ab7a85ea7257479c27ff"
+checksum = "c8642236affe6f4b742a82061f5e8d06814b88b10413e2e55976e450c6d43155"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3036,9 +3047,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-network"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8b70fd9f40f779304f5508f02ebf9f31d918062d43892caa43280a7d44b8e10"
+checksum = "282203796d5e1b2091bc4b6db129533304ce0c87ce8fd602da4c5d57163e6b88"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3077,9 +3088,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-storage"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fa486e454d4e5e549dbe0934baacff6b248c6ed23723412d023726ccb0a870f"
+checksum = "d9c6d527a63cba386dae50a52644db0dd1f140205e313fcc56e238ceade730f3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3101,9 +3112,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-storage-traits"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01a977dafa3f5675d6103412025da0e6a43d7277bf7a28e701b0aad8e84b820e"
+checksum = "5ee9d5aadd7ad542b89fc1c91933d3b5f3871d6230a8052e5fbc45ac9d9bc0e9"
 dependencies = [
  "bytes",
  "smallvec",
@@ -3140,6 +3151,7 @@ dependencies = [
  "tycho-storage",
  "tycho-types",
  "tycho-util",
+ "weedb",
 ]
 
 [[package]]
@@ -3181,9 +3193,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-util"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08916ef4b21089eaa42af87ca5237e3afd2274fbc9a420c31edf977895a60755"
+checksum = "e84668856c3fb977e10023e97e8a30a0a57d57c2ff2483d5db166e66937bb658"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3191,7 +3203,9 @@ dependencies = [
  "bytes",
  "bytesize",
  "castaway",
+ "crossbeam-deque",
  "dashmap",
+ "futures-executor",
  "futures-util",
  "getip",
  "humantime",
@@ -3220,9 +3234,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-util-proc"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8eb10f1275073a571dca1b6a4f4957900f10c9ec1393c1e41e8f5e201525f4e"
+checksum = "22cb4a114c2befb878f0e31669e9d39c31c1ef5f0e904d16f1b8ac54451bfbf2"
 dependencies = [
  "proc-macro2",
  "quote",

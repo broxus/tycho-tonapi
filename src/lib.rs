@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 
+pub mod db;
 pub mod grpc;
 pub mod state;
 pub mod util {

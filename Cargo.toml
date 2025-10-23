@@ -24,6 +24,7 @@ tokio-stream = "0.1.17"
 tonic = { version = "0.14", features = ["server"] }
 tonic-prost = "0.14.2"
 tracing = "0.1.41"
+weedb = "0.6.0"
 
 tikv-jemallocator = { version = "0.6.0", features = [
     "unprefixed_malloc_on_supported_platforms",
@@ -31,11 +32,11 @@ tikv-jemallocator = { version = "0.6.0", features = [
     "profiling",
 ] }
 
-tycho-block-util = { version = "0.3.2" }
-tycho-core = { version = "0.3.2" }
-tycho-storage = { version = "0.3.2" }
+tycho-block-util = { version = "0.3.3" }
+tycho-core = { version = "0.3.3" }
+tycho-storage = { version = "0.3.3" }
 tycho-types = { version = "0.3.0", features = ["sync", "base64", "models", "tycho", "rand9"] }
-tycho-util = { version = "0.3.2", features = ["cli"] }
+tycho-util = { version = "0.3.3", features = ["cli"] }
 
 [build-dependencies]
 anyhow = "1"
