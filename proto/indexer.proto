@@ -76,7 +76,7 @@ message GetBlockRequest {
         // Searches for a block by seqno.
         BlockBySeqno bySeqno = 1;
         // Searches for a block by its id.
-        BlockId byId = 2;
+        BlockById byId = 2;
     }
 }
 
@@ -119,7 +119,7 @@ message GetShardAccountRequest {
     // Find account state at the time of a specific block
     oneof atBlock {
         // Uses the latest states "edge".
-        NullValue latest = 4;
+        LatestBlock latest = 4;
         // Searches for a block by seqno.
         BlockBySeqno bySeqno = 5;
         // Searches for a block by its id.
@@ -131,10 +131,8 @@ message GetShardAccountResponse {
     oneof account {
         // Specified block not found.
         BlockNotFound blockNotFound = 1;
-        // Account state does not exist at the time of a specified block.
-        ShardAccountNotFound notFound = 2;
-        // Account state exists at the time of a specified block.
-        ShardAccountFound found = 3;
+        // Shard account info.
+        ShardAccount accessed = 2;
     }
 }
 
@@ -143,15 +141,16 @@ message ShardAccountNotFound {
     McStateInfo mcStateInfo = 1;
 }
 
-message ShardAccountFound {
+message ShardAccount {
     // Brief masterchain info at the moment of accessing the state.
     McStateInfo mcStateInfo = 1;
-    // BOC-encoded `ShardAccount`.
-    bytes accountState = 2;
-    // BOC-encoded "branch" from `ShardStateUnsplit` to the account `ShardAccounts` value.
-    // The "leaf" value of the account is a pruned cell.
-    optional bytes accountProof = 3;
-}
+    // BOC-encoded `ShardAccount` (if found).
+    optional bytes accountState = 2;
+    // BOC-encoded collection of proofs. Consists of two roots,
+    // the first one is shard state root proof cell
+    // and the second is account-in-state proof.
+    optional bytes proof = 3;
+} 
 
 // === Get library cell ===
 
@@ -200,6 +199,9 @@ message BlockById {
     BlockId id = 1;
 }
 
+message LatestBlock {
+}
+
 message BlockId {
     int32 workchain = 1;
     uint64 shard = 2;
@@ -207,5 +209,3 @@ message BlockId {
     bytes rootHash = 4;
     bytes fileHash = 5;
 }
-
-enum NullValue { NULL_VALUE = 0; }

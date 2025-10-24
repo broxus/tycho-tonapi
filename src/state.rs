@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -18,9 +18,13 @@ use tycho_core::block_strider::{BlockSubscriber, BlockSubscriberContext, StateSu
 use tycho_core::global_config::ZerostateId;
 use tycho_core::storage::CoreStorage;
 use tycho_storage::kv::NamedTables;
-use tycho_types::models::{BlockId, BlockIdShort, DepthBalanceInfo, LibDescr, ShardAccount};
+use tycho_types::merkle::MerkleProofBuilder;
+use tycho_types::models::{
+    Block, BlockId, BlockIdShort, DepthBalanceInfo, LibDescr, ShardAccount, ShardIdent,
+    ShardStateUnsplit, StdAddr,
+};
 use tycho_types::prelude::*;
-use tycho_util::FastHasherState;
+use tycho_util::{FastHashMap, FastHasherState};
 use weedb::{OwnedSnapshot, rocksdb};
 
 use crate::db::{TonApiDb, TonApiTables, tables};
@@ -28,11 +32,40 @@ use crate::db::{TonApiDb, TonApiTables, tables};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppStateConfig {
+    /// How many library cells to cache.
+    ///
+    /// Default: `100`
     pub libs_cache_capacity: u64,
+
+    /// Block data is divided into chunks of this size.
+    ///
+    /// Default: `1 MB`
     pub block_data_chunk_size: ByteSize,
+
+    /// Max parallel block downloads.
+    ///
+    /// Default: `1000`
     pub max_concurrent_downloads: usize,
+
+    /// Max parallel subscriptions for new block ids.
+    ///
+    /// Default: `10000`
     pub max_subscriptions: usize,
+
+    /// How many events are buffered for slow readers before skipping the oldest one.
+    ///
+    /// Default: `50`
     pub events_buffer_size: usize,
+
+    /// Keep at most this amount of masterchain states.
+    ///
+    /// Default: `3`
+    pub mc_states_tail_len: usize,
+
+    /// Keep at most this amount of non-masterchain states.
+    ///
+    /// Default: `3`
+    pub sc_states_tail_len: usize,
 }
 
 impl Default for AppStateConfig {
@@ -43,6 +76,8 @@ impl Default for AppStateConfig {
             max_concurrent_downloads: 1000,
             max_subscriptions: 10000,
             events_buffer_size: 50,
+            mc_states_tail_len: 3,
+            sc_states_tail_len: 3,
         }
     }
 }
@@ -70,7 +105,7 @@ impl AppState {
                 libs_cache: moka::sync::Cache::builder()
                     .max_capacity(config.libs_cache_capacity)
                     .build_with_hasher(Default::default()),
-                latest_mc_state: Default::default(),
+                latest_states: Default::default(),
                 block_data_chunk_size: config.block_data_chunk_size.as_u64(),
                 download_block_semaphore: Arc::new(Semaphore::new(config.max_concurrent_downloads)),
                 subscriptions_semaphore: Arc::new(Semaphore::new(config.max_subscriptions)),
@@ -106,10 +141,10 @@ impl AppState {
         let this = self.inner.as_ref();
         AppStatus {
             mc_state_info: if self.is_ready() {
-                this.latest_mc_state
+                this.latest_states
                     .load()
                     .as_ref()
-                    .map(|x| x.mc_state_info)
+                    .map(|x| x.mc_state.mc_state_info)
             } else {
                 None
             },
@@ -126,10 +161,10 @@ impl AppState {
     fn load_mc_state_info(&self) -> Result<McStateInfo, StateError> {
         let latest_mc_state = if self.is_ready() {
             self.inner
-                .latest_mc_state
+                .latest_states
                 .load()
                 .as_ref()
-                .map(|x| x.mc_state_info)
+                .map(|x| x.mc_state.mc_state_info)
         } else {
             None
         };
@@ -146,7 +181,7 @@ impl AppState {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| StateError::Internal(anyhow::anyhow!("subscription semaphore dropped")))?;
+            .map_err(|_| StateError::Internal(anyhow!("subscription semaphore dropped")))?;
 
         let new_blocks = self.inner.new_mc_block_events.subscribe();
         Ok(WithMcStateInfo::new(mc_state_info, NewBlocksStream {
@@ -188,7 +223,7 @@ impl AppState {
                 .clone()
                 .acquire_owned()
                 .await
-                .map_err(|_| StateError::Internal(anyhow::anyhow!("blocks semaphore dropped")))?;
+                .map_err(|_| StateError::Internal(anyhow!("blocks semaphore dropped")))?;
 
             // Check once more if block was removed during waiting for a permit.
             if !handle.has_data() {
@@ -214,10 +249,142 @@ impl AppState {
         Ok(WithMcStateInfo::new(mc_state_info, stream))
     }
 
-    pub fn get_account_state(&self) {}
+    pub async fn get_account_state(
+        &self,
+        address: &StdAddr,
+        with_proof: bool,
+        at_block: &AtBlock,
+    ) -> StateResult<Option<AccessedShardAccount>> {
+        let cached = match at_block {
+            AtBlock::Latest => 'state: {
+                // NOTE: Keep the scope of `latest` as small as possible.
+                let latest = self.inner.latest_states.load();
+                let Some(latest) = latest.as_ref() else {
+                    return Err(StateError::NotReady);
+                };
+
+                if address.is_masterchain() {
+                    break 'state latest.mc_state.clone();
+                } else {
+                    for (shard, state) in &latest.shard_states {
+                        if shard.contains_address(address) {
+                            break 'state state.clone();
+                        }
+                    }
+                }
+
+                return Ok(WithMcStateInfo::new(latest.mc_state.mc_state_info, None));
+            }
+            _ => todo!(),
+        };
+
+        // TODO: Add semaphore
+
+        let mc_state_info = cached.mc_state_info;
+
+        let (account_state, proof) = if with_proof {
+            let address = address.clone();
+            let db = self.inner.db.clone();
+            tokio::task::spawn_blocking(move || {
+                let block_id = cached.state.block_id();
+                debug_assert!(block_id.shard.workchain() == address.workchain as i32);
+
+                let usage_tree = UsageTree::new(UsageTreeMode::OnLoad);
+
+                // Get account and prepare its proof
+                let account_proof;
+                let account = {
+                    let state_root = usage_tree.track(cached.state.root_cell());
+                    let state = state_root.parse::<ShardStateUnsplit>()?;
+                    let (accounts, _) = state.accounts.load()?.into_parts();
+
+                    let account = accounts
+                        .get(&address.address)?
+                        .map(|(_, account)| account.account.into_inner());
+
+                    account_proof = {
+                        let state_root = cached.state.root_cell().as_ref();
+                        let proof = MerkleProofBuilder::new(state_root, usage_tree).build()?;
+                        CellBuilder::build_from(proof)?
+                    };
+
+                    // NOTE: We need to untrack the cell just in case if `usage_tree` is still alive.
+                    account.map(|cell| Boc::encode(Cell::untrack(cell)))
+                };
+
+                // Prepare state root proof
+                let mut key = [0; tables::KnownBlocks::KEY_LEN];
+                key[0] = address.workchain as u8;
+                key[1..9].copy_from_slice(&block_id.shard.prefix().to_be_bytes());
+                key[9..13].copy_from_slice(&block_id.seqno.to_be_bytes());
+
+                let Some(known_block) = db
+                    .known_blocks
+                    .get(key)
+                    .map_err(|e| StateError::Internal(e.into()))?
+                else {
+                    return Err(StateError::Internal(anyhow::anyhow!(
+                        "state root proof not found for block {block_id}"
+                    )));
+                };
+
+                let state_root_proof = {
+                    const OFFSET: usize = tables::KnownBlocks::STATE_PROOF_OFFSET;
+
+                    let known_block = known_block.as_ref();
+                    let state_proof_len =
+                        u32::from_le_bytes(known_block[OFFSET..OFFSET + 4].try_into().unwrap());
+
+                    Boc::decode(&known_block[OFFSET + 4..OFFSET + 4 + state_proof_len as usize])
+                        .map_err(|e| {
+                            StateError::Internal(anyhow!(
+                                "failed to deserialize state roof proof: {e:?}"
+                            ))
+                        })?
+                };
+                drop(known_block);
+
+                // Combine proofs into one cell
+                let proof = {
+                    let mut boc = tycho_types::boc::ser::BocHeader::<FastHasherState>::default();
+                    boc.add_root(state_root_proof.as_ref());
+                    boc.add_root(account_proof.as_ref());
+
+                    let mut buffer = Vec::new();
+                    boc.encode(&mut buffer);
+                    buffer
+                };
+
+                Ok::<_, StateError>((account, Some(proof)))
+            })
+            .await
+            .map_err(|_| StateError::Cancelled)??
+        } else {
+            // Simple case where we just access the account cell.
+
+            let account = cached
+                .accounts
+                .get(&address.address)?
+                .map(|(_, account)| account.account.into_inner())
+                .map(Boc::encode);
+
+            (account, None)
+        };
+
+        Ok(WithMcStateInfo::new(
+            mc_state_info,
+            Some(AccessedShardAccount {
+                account_state: account_state.map(Bytes::from),
+                proof: proof.map(Bytes::from),
+            }),
+        ))
+    }
 
     pub fn get_library_cell(&self, hash: &HashBytes) -> StateResult<Option<Bytes>> {
-        let Some(state) = self.inner.latest_mc_state.load_full() else {
+        let state = 'state: {
+            if let Some(latest) = self.inner.latest_states.load().as_ref() {
+                break 'state latest.mc_state.clone();
+            }
             return Err(StateError::NotReady);
         };
 
@@ -328,6 +495,13 @@ impl BlockSubscriber for AppState {
             key[5..13].copy_from_slice(&block_id.shard.prefix().to_be_bytes());
             key[13..17].copy_from_slice(&block_id.seqno.to_be_bytes());
 
+            let block_proof = make_state_root_proof(block.root_cell())
+                .map(Boc::encode)
+                .context("failed to build state root proof")?;
+            let Ok::<u32, _>(block_proof_len) = block_proof.len().try_into() else {
+                anyhow::bail!("state root proof is too big");
+            };
+
             // Reserve value buffer
             let mut value = Vec::<u8>::with_capacity(256);
 
@@ -336,7 +510,8 @@ impl BlockSubscriber for AppState {
             value.extend_from_slice(block_id.file_hash.as_array());
             value.extend_from_slice(&mc_seqno.to_le_bytes());
             value.extend_from_slice(&raw_data_size.to_le_bytes());
-            // TODO: Build state proof
+            value.extend_from_slice(&block_proof_len.to_le_bytes());
+            value.extend_from_slice(&block_proof);
 
             batch.put_cf(&db.known_blocks.cf(), &key[4..], &value);
 
@@ -405,27 +580,42 @@ impl StateSubscriber for AppState {
             let this = self.inner.as_ref();
 
             let block_id = cx.block.id();
-            if !block_id.is_masterchain() {
-                // TODO: Handle shard blocks as well
-                return Ok(());
+
+            // Reload storage cell from disk
+            let state = this
+                .storage
+                .shard_state_storage()
+                .load_state(cx.mc_block_id.seqno, block_id)
+                .await?;
+
+            let libraries;
+            let accounts;
+            let mc_state_info;
+            {
+                let state = state.as_ref();
+                libraries = state.libraries.clone();
+                accounts = state.load_accounts()?.into_parts().0;
+                mc_state_info = McStateInfo {
+                    mc_seqno: state.seqno,
+                    lt: state.gen_lt,
+                    utime: state.gen_utime,
+                };
             }
 
-            let state = cx.state.as_ref();
+            // TODO
 
-            let libraries = state.libraries.clone();
-            let (accounts, _) = state.load_accounts()?.into_parts();
-            let mc_state_info = McStateInfo {
-                mc_seqno: state.seqno,
-                lt: state.gen_lt,
-                utime: state.gen_utime,
-            };
+            // this.latest_mc_state.store(Some(Arc::new(CachedState {
+            //     root_hash: block_id.root_hash,
+            //     file_hash: block_id.file_hash,
+            //     state,
+            //     libraries,
+            //     accounts,
+            //     mc_state_info,
+            // })));
 
-            this.latest_mc_state.store(Some(Arc::new(CachedState {
-                state: cx.state.clone(),
-                libraries,
-                accounts,
-                mc_state_info,
-            })));
+            if !block_id.is_masterchain() {
+                return Ok(());
+            }
 
             // Update DB snapshot only after masterchain block has beed processed.
             this.db_snapshot
@@ -459,7 +649,7 @@ struct Inner {
     is_ready: AtomicBool,
     storage: CoreStorage,
     libs_cache: moka::sync::Cache<HashBytes, Bytes, FastHasherState>,
-    latest_mc_state: ArcSwapOption<CachedState>,
+    latest_states: ArcSwapOption<LatestStates>,
     block_data_chunk_size: u64,
     download_block_semaphore: Arc<Semaphore>,
     subscriptions_semaphore: Arc<Semaphore>,
@@ -469,6 +659,11 @@ struct Inner {
     new_mc_block_events: broadcast::Sender<Arc<NewMasterchainBlock>>,
     zerostate_id: ZerostateId,
     init_block_seqno: AtomicU32,
+}
+
+struct LatestStates {
+    mc_state: Arc<CachedState>,
+    shard_states: FastHashMap<ShardIdent, Arc<CachedState>>,
 }
 
 #[derive(Clone)]
@@ -510,6 +705,11 @@ pub struct AppStatus {
     pub init_block_seqno: u32,
 }
 
+pub struct AccessedShardAccount {
+    pub account_state: Option<Bytes>,
+    pub proof: Option<Bytes>,
+}
+
 #[derive(Default, Debug, Clone, Copy)]
 pub struct McStateInfo {
     pub mc_seqno: u32,
@@ -534,8 +734,8 @@ pub struct SkippedBlocksRange {
 #[derive(Debug, Clone, Copy)]
 pub enum AtBlock {
     Latest,
-    BySeqno(u32),
-    ByRootHash(HashBytes),
+    BySeqno(BlockIdShort),
+    ById(BlockId),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -624,6 +824,21 @@ impl Stream for BlockDataStream {
     }
 }
 
+fn make_state_root_proof(block_root: &Cell) -> Result<Cell, tycho_types::error::Error> {
+    let usage_tree = UsageTree::new(UsageTreeMode::OnLoad);
+
+    let block = usage_tree.track(block_root).parse::<Block>()?;
+    let block_info = block.load_info()?;
+    block_info.prev_ref.touch_recursive();
+    let _state_update = block.state_update.load()?;
+
+    let proof = MerkleProofBuilder::new(block_root.as_ref(), usage_tree)
+        .prune_big_cells(true)
+        .build()?;
+
+    CellBuilder::build_from(proof)
+}
+
 pub type StateResult<T> = Result<WithMcStateInfo<T>, StateError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -632,6 +847,8 @@ pub enum StateError {
     NotReady,
     #[error("internal error: {0}")]
     Internal(#[source] anyhow::Error),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl From<tycho_types::error::Error> for StateError {

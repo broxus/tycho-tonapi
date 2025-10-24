@@ -8,6 +8,8 @@ fn main() -> Result<()> {
         .build_server(true)
         .bytes(".indexer.LibraryCellFound.cell")
         .bytes(".indexer.BlockChunk.data")
+        .bytes(".indexer.ShardAccount.accountState")
+        .bytes(".indexer.ShardAccount.proof")
         .compile_protos(&["proto/indexer.proto"], &["proto"])?;
 
     let app_version = env("CARGO_PKG_VERSION")?;

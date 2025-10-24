@@ -51,6 +51,8 @@ pub mod tables {
 
     impl KnownBlocks {
         pub const KEY_LEN: usize = 1 + 8 + 4;
+
+        pub const STATE_PROOF_OFFSET: usize = 32 + 32 + 4 + 8;
     }
 
     impl ColumnFamily for KnownBlocks {

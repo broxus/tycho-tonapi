@@ -4,7 +4,7 @@ use std::task::{Context, Poll, ready};
 use futures_util::StreamExt;
 use tokio_stream::Stream;
 use tycho_types::cell::HashBytes;
-use tycho_types::models::{BlockIdShort, ShardIdent};
+use tycho_types::models::{BlockIdShort, ShardIdent, StdAddr};
 
 use crate::state::{AppState, StateError};
 
@@ -59,7 +59,16 @@ impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
         &self,
         request: tonic::Request<proto::GetBlockRequest>,
     ) -> tonic::Result<tonic::Response<Self::GetBlockStream>> {
-        let query = request.get_ref().query.require()?.try_into()?;
+        use self::proto::get_block_request::Query as ProtoQueryBlock;
+        use crate::state::QueryBlock;
+
+        let query = match request.get_ref().query.require()? {
+            ProtoQueryBlock::BySeqno(q) => QueryBlock::BySeqno(BlockIdShort {
+                shard: parse_shard_id(q.workchain, q.shard)?,
+                seqno: q.seqno,
+            }),
+            ProtoQueryBlock::ById(q) => QueryBlock::ById(q.id.require()?.try_into()?),
+        };
         let res = self.state.get_block(&query).await?;
 
         Ok(tonic::Response::new(match res.data {
@@ -80,7 +89,41 @@ impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
         &self,
         request: tonic::Request<proto::GetShardAccountRequest>,
     ) -> tonic::Result<tonic::Response<proto::GetShardAccountResponse>> {
-        todo!()
+        use self::proto::get_shard_account_request::AtBlock as ProtoAtBlock;
+        use self::proto::get_shard_account_response::Account as ProtoAccount;
+        use crate::state::AtBlock;
+
+        let request = request.get_ref();
+
+        let address = parse_address(request.workchain, &request.address)?;
+        let at_block = match &request.at_block {
+            None | Some(ProtoAtBlock::Latest(_)) => AtBlock::Latest,
+            Some(ProtoAtBlock::BySeqno(q)) => AtBlock::BySeqno(BlockIdShort {
+                shard: parse_shard_id(q.workchain, q.shard)?,
+                seqno: q.seqno,
+            }),
+            Some(ProtoAtBlock::ById(q)) => AtBlock::ById(q.id.require()?.try_into()?),
+        };
+
+        let res = self
+            .state
+            .get_account_state(&address, request.with_proof, &at_block)
+            .await?;
+
+        let msg = match res.data {
+            Some(accessed) => ProtoAccount::Accessed(proto::ShardAccount {
+                mc_state_info: Some(res.mc_state_info.into()),
+                account_state: accessed.account_state,
+                proof: accessed.proof,
+            }),
+            None => ProtoAccount::BlockNotFound(proto::BlockNotFound {
+                mc_state_info: Some(res.mc_state_info.into()),
+            }),
+        };
+
+        Ok(tonic::Response::new(proto::GetShardAccountResponse {
+            account: Some(msg),
+        }))
     }
 
     async fn get_library_cell(
@@ -276,11 +319,21 @@ fn parse_shard_id(workchain: i32, shard: u64) -> tonic::Result<ShardIdent> {
         .ok_or_else(|| tonic::Status::invalid_argument("invalid shard id"))
 }
 
+fn parse_address(workchain: i32, account: &[u8]) -> tonic::Result<StdAddr> {
+    let Ok::<i8, _>(workchain) = workchain.try_into() else {
+        return Err(tonic::Status::invalid_argument(
+            "workchain is out of std range",
+        ));
+    };
+    Ok(StdAddr::new(workchain, *parse_hash_ref(account)?))
+}
+
 impl From<StateError> for tonic::Status {
     fn from(value: StateError) -> Self {
         match value {
             StateError::NotReady => tonic::Status::unavailable("service is not ready"),
             StateError::Internal(error) => tonic::Status::internal(error.to_string()),
+            StateError::Cancelled => tonic::Status::cancelled("operation cancelled"),
         }
     }
 }
@@ -292,20 +345,6 @@ impl From<crate::state::McStateInfo> for proto::McStateInfo {
             mc_seqno: value.mc_seqno,
             lt: value.lt,
             utime: value.utime,
-        }
-    }
-}
-
-impl TryFrom<&proto::get_block_request::Query> for crate::state::QueryBlock {
-    type Error = tonic::Status;
-
-    fn try_from(value: &proto::get_block_request::Query) -> Result<Self, Self::Error> {
-        match value {
-            proto::get_block_request::Query::BySeqno(q) => Ok(Self::BySeqno(BlockIdShort {
-                shard: parse_shard_id(q.workchain, q.shard)?,
-                seqno: q.seqno,
-            })),
-            proto::get_block_request::Query::ById(q) => q.try_into().map(Self::ById),
         }
     }
 }
