@@ -3135,6 +3135,7 @@ dependencies = [
  "clap",
  "futures-util",
  "moka",
+ "parking_lot",
  "prost",
  "scopeguard",
  "serde",

@@ -94,6 +94,7 @@ impl Cmd {
         cli::logger::init_logger(&node_config.logger_config, self.logger_config.clone())?;
         cli::logger::set_abort_with_tracing();
 
+        node_config.threads.init_reclaimer().unwrap();
         node_config.threads.init_global_rayon_pool().unwrap();
         node_config
             .threads

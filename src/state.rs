@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,6 +11,7 @@ use bytes::Bytes;
 use bytesize::ByteSize;
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 use tokio_stream::Stream;
@@ -24,7 +27,8 @@ use tycho_types::models::{
     ShardStateUnsplit, StdAddr,
 };
 use tycho_types::prelude::*;
-use tycho_util::{FastHashMap, FastHasherState};
+use tycho_util::mem::Reclaimer;
+use tycho_util::{FastHashMap, FastHashSet, FastHasherState};
 use weedb::{OwnedSnapshot, rocksdb};
 
 use crate::db::{TonApiDb, TonApiTables, tables};
@@ -60,12 +64,7 @@ pub struct AppStateConfig {
     /// Keep at most this amount of masterchain states.
     ///
     /// Default: `3`
-    pub mc_states_tail_len: usize,
-
-    /// Keep at most this amount of non-masterchain states.
-    ///
-    /// Default: `3`
-    pub sc_states_tail_len: usize,
+    pub states_tail_len: NonZeroUsize,
 }
 
 impl Default for AppStateConfig {
@@ -76,8 +75,7 @@ impl Default for AppStateConfig {
             max_concurrent_downloads: 1000,
             max_subscriptions: 10000,
             events_buffer_size: 50,
-            mc_states_tail_len: 3,
-            sc_states_tail_len: 3,
+            states_tail_len: NonZeroUsize::new(3).unwrap(),
         }
     }
 }
@@ -106,12 +104,18 @@ impl AppState {
                     .max_capacity(config.libs_cache_capacity)
                     .build_with_hasher(Default::default()),
                 latest_states: Default::default(),
+                recent_states: RwLock::new(RecentStates {
+                    states_tail_len: config.states_tail_len,
+                    mc_seqno_start: 0,
+                    mc_states: Default::default(),
+                    shard_states: Default::default(),
+                }),
+                new_states: Default::default(),
                 block_data_chunk_size: config.block_data_chunk_size.as_u64(),
                 download_block_semaphore: Arc::new(Semaphore::new(config.max_concurrent_downloads)),
                 subscriptions_semaphore: Arc::new(Semaphore::new(config.max_subscriptions)),
                 db,
                 db_snapshot: Default::default(),
-                intermediate_block_ids: Default::default(),
                 new_mc_block_events,
                 zerostate_id,
                 init_block_seqno: AtomicU32::new(u32::MAX),
@@ -119,8 +123,45 @@ impl AppState {
         })
     }
 
-    pub async fn init(&self, _latest_block_id: &BlockId) -> Result<()> {
+    pub async fn init(&self, latest_block_id: &BlockId) -> Result<()> {
         let this = self.inner.as_ref();
+
+        // Preload latest states
+        let ref_by_mc_seqno = latest_block_id.seqno;
+
+        let mc_state = this
+            .storage
+            .shard_state_storage()
+            .load_state(ref_by_mc_seqno, latest_block_id)
+            .await
+            .and_then(CachedState::for_masterchain)
+            .map(Arc::new)?;
+
+        let mut shard_states = FastHashMap::default();
+        for entry in mc_state.state.shards()?.latest_blocks() {
+            let block_id = entry?;
+            let state = this
+                .storage
+                .shard_state_storage()
+                .load_state(ref_by_mc_seqno, &block_id)
+                .await?;
+
+            shard_states.insert(
+                block_id.shard,
+                CachedState::for_shard(state, mc_state.mc_state_info).map(Arc::new)?,
+            );
+        }
+
+        this.recent_states
+            .write()
+            .push(mc_state.clone(), shard_states.values().cloned().collect());
+
+        this.latest_states.store(Some(Arc::new(LatestStates {
+            mc_state,
+            shard_states,
+        })));
+
+        // Preload init block seqno
         let init_block_id = this
             .storage
             .node_state()
@@ -130,8 +171,9 @@ impl AppState {
         this.init_block_seqno
             .store(init_block_id.seqno, Ordering::Release);
 
-        // TODO: Preload the initial blocks edge.
+        // TODO: Preload partially processed block ids from the previous restart
 
+        // Done
         this.is_ready.store(true, Ordering::Release);
         tracing::info!("app state is ready");
         Ok(())
@@ -255,27 +297,48 @@ impl AppState {
         with_proof: bool,
         at_block: &AtBlock,
     ) -> StateResult<Option<AccessedShardAccount>> {
-        let cached = match at_block {
-            AtBlock::Latest => 'state: {
-                // NOTE: Keep the scope of `latest` as small as possible.
-                let latest = self.inner.latest_states.load();
-                let Some(latest) = latest.as_ref() else {
-                    return Err(StateError::NotReady);
-                };
+        // Find a cached state at the specified block.
+        // TODO: Load state from disk if not cached?
+        let cached = 'state: {
+            let mc_state_info;
+            match at_block {
+                AtBlock::Latest => {
+                    // NOTE: Keep the scope of `latest` as small as possible.
+                    let latest = self.inner.latest_states.load();
+                    let Some(latest) = latest.as_ref() else {
+                        return Err(StateError::NotReady);
+                    };
 
-                if address.is_masterchain() {
-                    break 'state latest.mc_state.clone();
-                } else {
-                    for (shard, state) in &latest.shard_states {
-                        if shard.contains_address(address) {
-                            break 'state state.clone();
+                    if address.is_masterchain() {
+                        break 'state latest.mc_state.clone();
+                    } else {
+                        for (shard, state) in &latest.shard_states {
+                            if shard.contains_address(address) {
+                                break 'state state.clone();
+                            }
                         }
                     }
-                }
 
-                return Ok(WithMcStateInfo::new(latest.mc_state.mc_state_info, None));
+                    mc_state_info = latest.mc_state.mc_state_info;
+                }
+                AtBlock::BySeqno(short_id) => {
+                    mc_state_info = self.load_mc_state_info()?;
+                    if let Some(cached) = self.inner.recent_states.read().get(short_id) {
+                        break 'state cached;
+                    }
+                }
+                AtBlock::ById(block_id) => {
+                    mc_state_info = self.load_mc_state_info()?;
+                    if let Some(cached) =
+                        self.inner.recent_states.read().get(&block_id.as_short_id())
+                        && cached.state.block_id() == block_id
+                    {
+                        break 'state cached;
+                    }
+                }
             }
-            _ => todo!(),
+
+            return Ok(WithMcStateInfo::new(mc_state_info, None));
         };
 
         // TODO: Add semaphore
@@ -549,19 +612,10 @@ impl BlockSubscriber for AppState {
 
     fn handle_block<'a>(
         &'a self,
-        cx: &'a BlockSubscriberContext,
+        _cx: &'a BlockSubscriberContext,
         prepared: Self::Prepared,
     ) -> Self::HandleBlockFut<'a> {
         Box::pin(async move {
-            if !cx.block.id().is_masterchain() {
-                let mut intermediate = self.inner.intermediate_block_ids.lock().unwrap();
-                if intermediate.ref_by_mc_seqno != cx.mc_block_id.seqno {
-                    intermediate.ref_by_mc_seqno = cx.mc_block_id.seqno;
-                    intermediate.shard_block_ids.clear();
-                }
-                intermediate.shard_block_ids.push(*cx.block.id());
-            }
-
             prepared.await?.context("failed to store block metadata")?;
 
             Ok(())
@@ -579,6 +633,10 @@ impl StateSubscriber for AppState {
         Box::pin(async move {
             let this = self.inner.as_ref();
 
+            let Some(prev_latest_states) = this.latest_states.load_full() else {
+                anyhow::bail!("app state was not properly initialized");
+            };
+
             let block_id = cx.block.id();
 
             // Reload storage cell from disk
@@ -588,32 +646,13 @@ impl StateSubscriber for AppState {
                 .load_state(cx.mc_block_id.seqno, block_id)
                 .await?;
 
-            let libraries;
-            let accounts;
-            let mc_state_info;
-            {
-                let state = state.as_ref();
-                libraries = state.libraries.clone();
-                accounts = state.load_accounts()?.into_parts().0;
-                mc_state_info = McStateInfo {
-                    mc_seqno: state.seqno,
-                    lt: state.gen_lt,
-                    utime: state.gen_utime,
-                };
-            }
-
-            // TODO
-
-            // this.latest_mc_state.store(Some(Arc::new(CachedState {
-            //     root_hash: block_id.root_hash,
-            //     file_hash: block_id.file_hash,
-            //     state,
-            //     libraries,
-            //     accounts,
-            //     mc_state_info,
-            // })));
-
-            if !block_id.is_masterchain() {
+            if !cx.block.id().is_masterchain() {
+                let mut new = self.inner.new_states.lock().unwrap();
+                if new.ref_by_mc_seqno != cx.mc_block_id.seqno {
+                    new.ref_by_mc_seqno = cx.mc_block_id.seqno;
+                    new.shard_states.clear();
+                }
+                new.shard_states.push(state);
                 return Ok(());
             }
 
@@ -621,19 +660,48 @@ impl StateSubscriber for AppState {
             this.db_snapshot
                 .store(Some(Arc::new(this.db.owned_snapshot())));
 
+            // Prepare cached mc state
+            let mc_state = CachedState::for_masterchain(state).map(Arc::new)?;
+
             // Send new block event.
-            let shard_block_ids = {
-                let mut intermediate = this.intermediate_block_ids.lock().unwrap();
-                if intermediate.ref_by_mc_seqno == block_id.seqno {
-                    std::mem::take(&mut intermediate.shard_block_ids)
+            let mut new_shard_states = {
+                let mut new = this.new_states.lock().unwrap();
+                if new.ref_by_mc_seqno == block_id.seqno {
+                    std::mem::take(&mut new.shard_states)
                 } else {
-                    intermediate.shard_block_ids.clear();
+                    new.shard_states.clear();
                     Vec::new()
                 }
             };
+
+            // FIXME: Should not sort like this, but its ok for now since there is one base shard.
+            new_shard_states.sort_unstable_by(|a, b| a.block_id().cmp(b.block_id()));
+
+            let mut shard_block_ids = Vec::with_capacity(new_shard_states.len());
+            let new_shard_states = new_shard_states
+                .into_iter()
+                .map(|state| {
+                    shard_block_ids.push(*state.block_id());
+                    CachedState::for_shard(state, mc_state.mc_state_info).map(Arc::new)
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            // Update the latest states
+            this.latest_states.store(Some(Arc::new(LatestStates {
+                mc_state: mc_state.clone(),
+                // FIXME: Assumes that there is only one base shard for now.
+                shard_states: match new_shard_states.last() {
+                    None => prev_latest_states.shard_states.clone(),
+                    Some(shard) => {
+                        FastHashMap::from_iter([(shard.state.block_id().shard, shard.clone())])
+                    }
+                },
+            })));
+
+            // Send event
             this.new_mc_block_events
                 .send(Arc::new(NewMasterchainBlock {
-                    mc_state_info,
+                    mc_state_info: mc_state.mc_state_info,
                     mc_block_id: *block_id,
                     shard_block_ids,
                 }))
@@ -650,12 +718,13 @@ struct Inner {
     storage: CoreStorage,
     libs_cache: moka::sync::Cache<HashBytes, Bytes, FastHasherState>,
     latest_states: ArcSwapOption<LatestStates>,
+    recent_states: RwLock<RecentStates>,
+    new_states: Mutex<NewStates>,
     block_data_chunk_size: u64,
     download_block_semaphore: Arc<Semaphore>,
     subscriptions_semaphore: Arc<Semaphore>,
     db: TonApiDb,
     db_snapshot: ArcSwapOption<OwnedSnapshot>,
-    intermediate_block_ids: Mutex<ShardBlockIds>,
     new_mc_block_events: broadcast::Sender<Arc<NewMasterchainBlock>>,
     zerostate_id: ZerostateId,
     init_block_seqno: AtomicU32,
@@ -666,6 +735,66 @@ struct LatestStates {
     shard_states: FastHashMap<ShardIdent, Arc<CachedState>>,
 }
 
+struct RecentStates {
+    states_tail_len: NonZeroUsize,
+    mc_seqno_start: u32,
+    mc_states: VecDeque<Arc<CachedState>>,
+    shard_states: FastHashMap<BlockIdShort, Arc<CachedState>>,
+}
+
+impl RecentStates {
+    fn push(&mut self, mc_state: Arc<CachedState>, shard_states: Vec<Arc<CachedState>>) {
+        if self.mc_states.is_empty() {
+            assert_eq!(self.mc_seqno_start, 0);
+            self.mc_seqno_start = mc_state.state.block_id().seqno;
+            self.mc_states.push_back(mc_state);
+        } else {
+            self.mc_states.push_back(mc_state);
+            if self.mc_states.len() > self.states_tail_len.get() {
+                let oldest = self.mc_states.pop_front().expect("mc state not empty");
+                assert_eq!(oldest.state.block_id().seqno, self.mc_seqno_start);
+                self.mc_seqno_start += 1;
+                Reclaimer::instance().drop(oldest);
+            }
+        }
+
+        let mut shard_updated = FastHashSet::default();
+        for shard in shard_states {
+            shard_updated.insert(shard.state.block_id().shard);
+            self.shard_states
+                .insert(shard.state.block_id().as_short_id(), shard);
+        }
+
+        self.shard_states.retain(|short_id, cached| {
+            if !shard_updated.contains(&short_id.shard) {
+                // Retain shards that were not updated
+                return true;
+            }
+
+            // Keep shard states referenced by the current mc states tail
+            cached.mc_state_info.mc_seqno >= self.mc_seqno_start
+        });
+    }
+
+    fn get(&self, short_id: &BlockIdShort) -> Option<Arc<CachedState>> {
+        if short_id.is_masterchain() {
+            short_id
+                .seqno
+                .checked_sub(self.mc_seqno_start)
+                .and_then(|idx| self.mc_states.get(idx as usize))
+        } else {
+            self.shard_states.get(short_id)
+        }
+        .cloned()
+    }
+}
+
+#[derive(Default)]
+struct NewStates {
+    ref_by_mc_seqno: u32,
+    shard_states: Vec<ShardStateStuff>,
+}
+
 #[derive(Clone)]
 struct CachedState {
     state: ShardStateStuff,
@@ -674,10 +803,39 @@ struct CachedState {
     mc_state_info: McStateInfo,
 }
 
-#[derive(Default)]
-struct ShardBlockIds {
-    ref_by_mc_seqno: u32,
-    shard_block_ids: Vec<BlockId>,
+impl CachedState {
+    fn for_masterchain(state: ShardStateStuff) -> Result<Self> {
+        let libraries;
+        let accounts;
+        let mc_state_info;
+        {
+            let state = state.as_ref();
+            libraries = state.libraries.clone();
+            accounts = state.load_accounts()?.into_parts().0;
+            mc_state_info = McStateInfo {
+                mc_seqno: state.seqno,
+                lt: state.gen_lt,
+                utime: state.gen_utime,
+            };
+        }
+
+        Ok(Self {
+            state,
+            libraries,
+            accounts,
+            mc_state_info,
+        })
+    }
+
+    fn for_shard(state: ShardStateStuff, mc_state_info: McStateInfo) -> Result<Self> {
+        let (accounts, _) = state.as_ref().load_accounts()?.into_parts();
+        Ok(Self {
+            state,
+            libraries: Dict::new(),
+            accounts,
+            mc_state_info,
+        })
+    }
 }
 
 type ShardAccountsDict = Dict<HashBytes, (DepthBalanceInfo, ShardAccount)>;
