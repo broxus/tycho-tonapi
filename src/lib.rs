@@ -3,9 +3,6 @@ use std::sync::OnceLock;
 pub mod db;
 pub mod grpc;
 pub mod state;
-pub mod util {
-    pub mod serde_helpers;
-}
 
 pub static BIN_VERSION: &str = env!("TYCHO_VERSION");
 pub static BIN_BUILD: &str = env!("TYCHO_BUILD");

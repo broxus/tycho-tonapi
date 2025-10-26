@@ -367,7 +367,9 @@ impl AppState {
 
                     account_proof = {
                         let state_root = cached.state.root_cell().as_ref();
-                        let proof = MerkleProofBuilder::new(state_root, usage_tree).build()?;
+                        let proof = MerkleProofBuilder::new(state_root, usage_tree)
+                            .prune_big_cells(true)
+                            .build()?;
                         CellBuilder::build_from(proof)?
                     };
 
@@ -504,6 +506,7 @@ impl BlockSubscriber for AppState {
             id: BlockId,
             start_lt: u64,
             end_lt: u64,
+            reg_mc_seqno: u32,
         }
 
         let block_id = *cx.block.id();
@@ -543,6 +546,7 @@ impl BlockSubscriber for AppState {
                             },
                             start_lt: descr.start_lt,
                             end_lt: descr.end_lt,
+                            reg_mc_seqno: descr.reg_mc_seqno,
                         })
                     }
                     Ok::<_, anyhow::Error>(shards)
@@ -594,6 +598,7 @@ impl BlockSubscriber for AppState {
                     value.extend_from_slice(item.id.file_hash.as_array());
                     value.extend_from_slice(&item.start_lt.to_le_bytes());
                     value.extend_from_slice(&item.end_lt.to_le_bytes());
+                    value.extend_from_slice(&item.reg_mc_seqno.to_le_bytes());
                 }
             }
 
@@ -660,6 +665,25 @@ impl StateSubscriber for AppState {
             this.db_snapshot
                 .store(Some(Arc::new(this.db.owned_snapshot())));
 
+            let mut shard_description = Vec::new();
+            {
+                let custom = cx.block.load_custom()?;
+                for entry in custom.shards.iter() {
+                    let (shard, descr) = entry?;
+                    shard_description.push(BriefShardDescription {
+                        block_id: BlockId {
+                            shard,
+                            seqno: descr.seqno,
+                            root_hash: descr.root_hash,
+                            file_hash: descr.file_hash,
+                        },
+                        end_lt: descr.end_lt,
+                        gen_utime: descr.gen_utime,
+                        reg_mc_seqno: descr.reg_mc_seqno,
+                    });
+                }
+            };
+
             // Prepare cached mc state
             let mc_state = CachedState::for_masterchain(state).map(Arc::new)?;
 
@@ -703,6 +727,7 @@ impl StateSubscriber for AppState {
                 .send(Arc::new(NewMasterchainBlock {
                     mc_state_info: mc_state.mc_state_info,
                     mc_block_id: *block_id,
+                    shard_description,
                     shard_block_ids,
                 }))
                 .ok();
@@ -879,7 +904,16 @@ pub struct McStateInfo {
 pub struct NewMasterchainBlock {
     pub mc_state_info: McStateInfo,
     pub mc_block_id: BlockId,
+    pub shard_description: Vec<BriefShardDescription>,
     pub shard_block_ids: Vec<BlockId>,
+}
+
+#[derive(Debug)]
+pub struct BriefShardDescription {
+    pub block_id: BlockId,
+    pub end_lt: u64,
+    pub gen_utime: u32,
+    pub reg_mc_seqno: u32,
 }
 
 #[derive(Debug)]

@@ -72,7 +72,7 @@ pub mod tables {
     ///
     /// # Additional value for masterchain
     /// - `shard_count: u32 (LE), shard_count * (workchain: i8, shard: u64 (LE), seqno: u32 (LE)),
-    ///   root_hash: [u8; 32], file_hash: [u8; 32], start_lt: u64 (LE), end_lt: (LE))`
+    ///   root_hash: [u8; 32], file_hash: [u8; 32], start_lt: u64 (LE), end_lt: u64 (LE), reg_mc_seqno: u32 (LE))`
     pub struct BlocksByMcSeqno;
 
     impl BlocksByMcSeqno {

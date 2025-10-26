@@ -170,6 +170,16 @@ impl tokio_stream::Stream for WatchBlockIdsStream {
                 Event::NewMcBlock(proto::NewMasterchainBlock {
                     mc_state_info: Some(item.mc_state_info.into()),
                     mc_block_id: Some(item.mc_block_id.into()),
+                    shard_description: item
+                        .shard_description
+                        .iter()
+                        .map(|item| proto::ShardDescription {
+                            latest_block_id: Some(item.block_id.into()),
+                            end_lt: item.end_lt,
+                            utime: item.gen_utime,
+                            reg_mc_seqno: item.reg_mc_seqno,
+                        })
+                        .collect(),
                     shard_block_ids: item.shard_block_ids.iter().map(Into::into).collect(),
                 })
             }

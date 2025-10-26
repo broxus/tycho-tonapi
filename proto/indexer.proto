@@ -64,9 +64,22 @@ message NewMasterchainBlock {
     McStateInfo mcStateInfo = 1;
     // The id of the masterchain block.
     BlockId mcBlockId = 2;
+    // Brief info for all shards in all workchains other than masterchain.
+    repeated ShardDescription shardDescription = 3;
     // All shard block ids since the previous masterchain block.
     // (can be empty if no new shard blocks were produced).
-    repeated BlockId shardBlockIds = 3;
+    repeated BlockId shardBlockIds = 4;
+}
+
+message ShardDescription {
+    // Id of the latest block in that shard.
+    BlockId latestBlockId = 1;
+    // LT of the latest block in that shard.
+    uint64 endLt = 2;
+    // Unix timestamp when the latest block was generated.
+    uint32 utime = 3;
+    // The latest known masterchain block at the time of shard generation.
+    uint32 regMcSeqno = 4;
 }
 
 // === Get block ===
@@ -150,7 +163,7 @@ message ShardAccount {
     // the first one is shard state root proof cell
     // and the second is account-in-state proof.
     optional bytes proof = 3;
-} 
+}
 
 // === Get library cell ===
 
