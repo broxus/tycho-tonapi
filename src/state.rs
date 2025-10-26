@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use arc_swap::ArcSwapOption;
@@ -14,12 +15,14 @@ use futures_util::future::BoxFuture;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
+use tokio::task::AbortHandle;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::BroadcastStream;
+use tracing::Instrument;
 use tycho_block_util::state::ShardStateStuff;
 use tycho_core::block_strider::{BlockSubscriber, BlockSubscriberContext, StateSubscriber};
 use tycho_core::global_config::ZerostateId;
-use tycho_core::storage::CoreStorage;
+use tycho_core::storage::{BlocksGcConfig, BlocksGcType, CoreStorage};
 use tycho_storage::kv::NamedTables;
 use tycho_types::merkle::MerkleProofBuilder;
 use tycho_types::models::{
@@ -28,10 +31,13 @@ use tycho_types::models::{
 };
 use tycho_types::prelude::*;
 use tycho_util::mem::Reclaimer;
-use tycho_util::{FastHashMap, FastHashSet, FastHasherState};
+use tycho_util::{FastHashMap, FastHashSet, FastHasherState, serde_helpers};
 use weedb::{OwnedSnapshot, rocksdb};
 
 use crate::db::{TonApiDb, TonApiTables, tables};
+
+const MIN_GC_SEQNO_OFFSET: u32 = 200;
+const FALLBACK_GC_SEQNO_OFFSET: u32 = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -65,6 +71,12 @@ pub struct AppStateConfig {
     ///
     /// Default: `3`
     pub states_tail_len: NonZeroUsize,
+
+    /// Interval for known blocks GC.
+    ///
+    /// Default: `1 min`
+    #[serde(with = "serde_helpers::humantime")]
+    pub gc_interval: Duration,
 }
 
 impl Default for AppStateConfig {
@@ -76,6 +88,7 @@ impl Default for AppStateConfig {
             max_subscriptions: 10000,
             events_buffer_size: 50,
             states_tail_len: NonZeroUsize::new(3).unwrap(),
+            gc_interval: Duration::from_secs(60),
         }
     }
 }
@@ -91,10 +104,28 @@ impl AppState {
         storage: CoreStorage,
         zerostate_id: ZerostateId,
         config: AppStateConfig,
+        blocks_gc: Option<BlocksGcConfig>,
     ) -> Result<Self> {
+        let gc_seqno_offset = 'gc_offset: {
+            if let Some(gc) = blocks_gc
+                && let BlocksGcType::BeforeSafeDistance { safe_distance, .. } = gc.ty
+            {
+                break 'gc_offset std::cmp::max(safe_distance, MIN_GC_SEQNO_OFFSET);
+            }
+
+            FALLBACK_GC_SEQNO_OFFSET
+        };
+
         let db = storage.context().open_preconfigured(TonApiTables::NAME)?;
 
         let (new_mc_block_events, _) = broadcast::channel(config.events_buffer_size);
+
+        tracing::info!(
+            gc_seqno_offset,
+            block_data_chunk_size = %config.block_data_chunk_size,
+            events_buffer_size = config.events_buffer_size,
+            "app state created"
+        );
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -119,6 +150,9 @@ impl AppState {
                 new_mc_block_events,
                 zerostate_id,
                 init_block_seqno: AtomicU32::new(u32::MAX),
+                gc_seqno_offset,
+                gc_interval: config.gc_interval,
+                gc_task_handle: Default::default(),
             }),
         })
     }
@@ -173,8 +207,54 @@ impl AppState {
 
         // TODO: Preload partially processed block ids from the previous restart
 
+        // Spawn known blocks gc
+        let gc_task = tokio::spawn({
+            let span = tracing::info_span!("known_blocks_gc");
+
+            let gc_interval = this.gc_interval;
+            let this = Arc::downgrade(&self.inner);
+            async move {
+                tracing::info!("started");
+                scopeguard::defer!(tracing::info!("finished"));
+
+                let mut interval = tokio::time::interval(gc_interval);
+
+                let mut progress = 0;
+                loop {
+                    interval.tick().await;
+
+                    let Some(this) = this.upgrade() else {
+                        return;
+                    };
+
+                    let latest_mc_seqno = this
+                        .latest_states
+                        .load()
+                        .as_ref()
+                        .map(|latest| latest.mc_state.mc_state_info.mc_seqno)
+                        .unwrap_or_default();
+
+                    let Some(remove_until) = latest_mc_seqno.checked_sub(this.gc_seqno_offset)
+                    else {
+                        continue;
+                    };
+
+                    if remove_until > progress {
+                        match this.remove_known_blocks(remove_until).await {
+                            Ok(_) => progress = remove_until,
+                            Err(e) => tracing::error!("failed to remove known blocks: {e}"),
+                        }
+                    }
+                }
+            }
+            .instrument(span)
+        });
+        *this.gc_task_handle.lock().unwrap() = Some(gc_task.abort_handle());
+
         // Done
-        this.is_ready.store(true, Ordering::Release);
+        let was_ready = this.is_ready.swap(true, Ordering::Release);
+        assert!(!was_ready);
+
         tracing::info!("app state is ready");
         Ok(())
     }
@@ -348,7 +428,10 @@ impl AppState {
         let (account_state, proof) = if with_proof {
             let address = address.clone();
             let db = self.inner.db.clone();
+            let span = tracing::Span::current();
             tokio::task::spawn_blocking(move || {
+                let _span = span.enter();
+
                 let block_id = cached.state.block_id();
                 debug_assert!(block_id.shard.workchain() == address.workchain as i32);
 
@@ -518,11 +601,14 @@ impl BlockSubscriber for AppState {
 
         let block = cx.block.clone();
         let db = self.inner.db.clone();
+        let span = tracing::Span::current();
         let handle = tokio::task::spawn_blocking(move || {
             // Skip unusual workchains
             let Ok::<i8, _>(workchain) = block_id.shard.workchain().try_into() else {
                 return Ok(());
             };
+
+            let _span = span.enter();
 
             let info = block.load_info()?;
 
@@ -753,6 +839,117 @@ struct Inner {
     new_mc_block_events: broadcast::Sender<Arc<NewMasterchainBlock>>,
     zerostate_id: ZerostateId,
     init_block_seqno: AtomicU32,
+    gc_seqno_offset: u32,
+    gc_interval: Duration,
+    gc_task_handle: Mutex<Option<AbortHandle>>,
+}
+
+impl Inner {
+    async fn remove_known_blocks(&self, until_mc_seqno: u32) -> Result<bool> {
+        tracing::info!(until_mc_seqno, "started known blocks gc");
+        let started_at = Instant::now();
+
+        let db = self.db.clone();
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            let _span = span.enter();
+
+            // Find shard blocks edge.
+            let mut key = [0; tables::BlocksByMcSeqno::KEY_LEN];
+            key[0..4].copy_from_slice(&until_mc_seqno.to_be_bytes());
+            key[4] = ShardIdent::MASTERCHAIN.workchain() as u8;
+            key[5..13].copy_from_slice(&ShardIdent::MASTERCHAIN.prefix().to_be_bytes());
+            key[13..17].copy_from_slice(&until_mc_seqno.to_be_bytes());
+            let Some(value) = db.blocks_by_mc_seqno.get(key)? else {
+                tracing::info!("target block not found, skipping");
+                return Ok(false);
+            };
+
+            tracing::info!(
+                short_id = %format_args!("{}:{until_mc_seqno}", ShardIdent::MASTERCHAIN),
+                "found target masterchain block"
+            );
+
+            let mut batch = rocksdb::WriteBatch::default();
+
+            // Delete a range from `blocks_by_mc_seqno` table.
+            key[4..].fill(0xff);
+            batch.delete_range_cf(
+                &db.blocks_by_mc_seqno.cf(),
+                [0; tables::BlocksByMcSeqno::KEY_LEN].as_slice(),
+                key.as_slice(),
+            );
+
+            // Remove known mc blocks.
+            let mut range_from = [0u8; tables::KnownBlocks::KEY_LEN];
+            // NOTE: copy workchain+shard from key because it already contains a mc shard.
+            range_from[0..9].copy_from_slice(&key[4..13]);
+            let mut range_to = range_from;
+            // NOTE: range_to has +1 block to make the range inclusive.
+            range_to[9..13].copy_from_slice(&until_mc_seqno.saturating_add(1).to_be_bytes());
+
+            batch.delete_range_cf(
+                &db.known_blocks.cf(),
+                range_from.as_slice(),
+                range_to.as_slice(),
+            );
+
+            // Remove all referenced shard blocks up to this mc block.
+            {
+                const OFFSET: usize = tables::BlocksByMcSeqno::SHARD_HASHES_OFFSET;
+
+                let mut value = value.as_ref();
+
+                let shard_count = u32::from_le_bytes(value[OFFSET..OFFSET + 4].try_into().unwrap());
+                value = &value[OFFSET + 4..];
+                for _ in 0..shard_count {
+                    let workchain = value[0] as i8;
+                    let shard = u64::from_le_bytes(value[1..9].try_into().unwrap());
+                    let seqno = u32::from_le_bytes(value[9..13].try_into().unwrap());
+
+                    tracing::info!(
+                        short_id = %format_args!("{workchain}:{shard:016x}:{seqno}"),
+                        "found target shard block"
+                    );
+
+                    // Update workchain+shard for shard blocks (seqno for range_from is still 0).
+                    range_from[0] = workchain as u8;
+                    range_from[1..9].copy_from_slice(&shard.to_be_bytes());
+
+                    // Copy workchain+short for range end and set the seqno
+                    range_to[0..9].copy_from_slice(&range_from[0..9]);
+                    // NOTE: range_to has +1 block to make the range inclusive.
+                    range_to[9..13].copy_from_slice(&seqno.saturating_add(1).to_be_bytes());
+
+                    batch.delete_range_cf(
+                        &db.known_blocks.cf(),
+                        range_from.as_slice(),
+                        range_to.as_slice(),
+                    );
+
+                    // Move to the next shard description
+                    value = &value[tables::BlocksByMcSeqno::SHARD_HASHES_ITEM_LEN..];
+                }
+            }
+
+            db.rocksdb().write(batch)?;
+
+            tracing::info!(
+                elapsed = %humantime::format_duration(started_at.elapsed()),
+                "known blocks gc finished"
+            );
+            Ok(true)
+        })
+        .await?
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(handle) = self.gc_task_handle.get_mut().unwrap().take() {
+            handle.abort();
+        }
+    }
 }
 
 struct LatestStates {

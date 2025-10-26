@@ -126,6 +126,7 @@ impl Cmd {
             node.core_storage.clone(),
             global_config.zerostate,
             node_config.app,
+            node_config.base.core_storage.blocks_gc,
         )?;
 
         // Bind gRPC
