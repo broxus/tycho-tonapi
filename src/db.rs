@@ -68,18 +68,18 @@ pub mod tables {
     /// Blocks by logical time.
     ///
     /// - Key: `mc_seqno: u32 (BE), workchain: i8, shard: u64 (BE), seqno: u32 (BE)`
-    /// - Value: `root_hash: [u8; 32], file_hash: [u8; 32], start_lt: u64 (LE), end_lt: u64 (LE)`
+    /// - Value: `root_hash: [u8; 32], file_hash: [u8; 32], end_lt: u64 (LE), gen_utime: u32`
     ///
     /// # Additional value for masterchain
     /// - `shard_count: u32 (LE), shard_count * (workchain: i8, shard: u64 (LE), seqno: u32 (LE)),
-    ///   root_hash: [u8; 32], file_hash: [u8; 32], start_lt: u64 (LE), end_lt: u64 (LE), reg_mc_seqno: u32 (LE))`
+    ///   root_hash: [u8; 32], file_hash: [u8; 32], end_lt: u64 (LE), gen_utime: u32 (LE), reg_mc_seqno: u32 (LE))`
     pub struct BlocksByMcSeqno;
 
     impl BlocksByMcSeqno {
         pub const KEY_LEN: usize = 4 + 1 + 8 + 4;
 
-        pub const SHARD_HASHES_OFFSET: usize = 32 + 32 + 8 + 8;
-        pub const SHARD_HASHES_ITEM_LEN: usize = 1 + 8 + 4 + 32 + 32 + 8 + 8 + 4;
+        pub const SHARD_HASHES_OFFSET: usize = 32 + 32 + 8 + 4;
+        pub const SHARD_HASHES_ITEM_LEN: usize = 1 + 8 + 4 + 32 + 32 + 8 + 4 + 4;
     }
 
     impl ColumnFamily for BlocksByMcSeqno {

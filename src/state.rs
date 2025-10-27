@@ -10,14 +10,13 @@ use anyhow::{Context as _, Result, anyhow};
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use bytesize::ByteSize;
-use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::AbortHandle;
 use tokio_stream::Stream;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
 use tycho_block_util::state::ShardStateStuff;
 use tycho_core::block_strider::{BlockSubscriber, BlockSubscriberContext, StateSubscriber};
@@ -118,12 +117,11 @@ impl AppState {
 
         let db = storage.context().open_preconfigured(TonApiTables::NAME)?;
 
-        let (new_mc_block_events, _) = broadcast::channel(config.events_buffer_size);
+        let (new_mc_block_events, _) = watch::channel(None);
 
         tracing::info!(
             gc_seqno_offset,
             block_data_chunk_size = %config.block_data_chunk_size,
-            events_buffer_size = config.events_buffer_size,
             "app state created"
         );
 
@@ -147,7 +145,7 @@ impl AppState {
                 subscriptions_semaphore: Arc::new(Semaphore::new(config.max_subscriptions)),
                 db,
                 db_snapshot: Default::default(),
-                new_mc_block_events,
+                latest_mc_block_event: new_mc_block_events,
                 zerostate_id,
                 init_block_seqno: AtomicU32::new(u32::MAX),
                 gc_seqno_offset,
@@ -277,26 +275,14 @@ impl AppState {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.inner.is_ready.load(Ordering::Acquire)
+        self.inner.is_ready()
     }
 
-    fn load_mc_state_info(&self) -> Result<McStateInfo, StateError> {
-        let latest_mc_state = if self.is_ready() {
-            self.inner
-                .latest_states
-                .load()
-                .as_ref()
-                .map(|x| x.mc_state.mc_state_info)
-        } else {
-            None
-        };
+    pub async fn watch_new_blocks(&self, since_mc_seqno: u32) -> StateResult<NewBlocksStream> {
+        const BUFFER_EVENTS: usize = 2;
 
-        latest_mc_state.ok_or(StateError::NotReady)
-    }
-
-    pub async fn watch_new_blocks(&self) -> StateResult<NewBlocksStream> {
         let this = self.inner.as_ref();
-        let mc_state_info = self.load_mc_state_info()?;
+        let mc_state_info = this.load_mc_state_info()?;
 
         let permit = this
             .subscriptions_semaphore
@@ -305,17 +291,131 @@ impl AppState {
             .await
             .map_err(|_| StateError::Internal(anyhow!("subscription semaphore dropped")))?;
 
-        let new_blocks = self.inner.new_mc_block_events.subscribe();
-        Ok(WithMcStateInfo::new(mc_state_info, NewBlocksStream {
-            inner: self.inner.clone(),
-            new_blocks: BroadcastStream::new(new_blocks),
-            _permit: permit,
-        }))
+        let mut latest_event = this.latest_mc_block_event.subscribe();
+
+        let (tx, rx) = mpsc::channel(BUFFER_EVENTS);
+        let this = Arc::downgrade(&self.inner);
+        tokio::task::spawn(async move {
+            scopeguard::defer!(tracing::debug!("watch stream dropped"));
+
+            // Capture permit.
+            let _permit = permit;
+
+            let mut at_seqno = since_mc_seqno;
+            let mut can_use_db = true;
+            let mut pending_event = None;
+
+            'outer: loop {
+                let event = 'event: {
+                    if let Some(event) = pending_event.take() {
+                        break 'event Ok(NewBlocksStreamItem::NewMcBlock(event));
+                    }
+
+                    let already_searched = can_use_db;
+                    if can_use_db {
+                        let Some(this) = this.upgrade() else {
+                            return;
+                        };
+
+                        let loaded = (|| {
+                            // Search the exact event first.
+                            let snapshot = match this.get_old_mc_block_event(at_seqno, None)? {
+                                OldEvent::Found(event) => {
+                                    at_seqno = event.mc_block_id.seqno.saturating_add(1);
+                                    return Ok(Some(NewBlocksStreamItem::NewMcBlock(event)));
+                                }
+                                OldEvent::NotFound(snapshot) => snapshot,
+                            };
+
+                            // Find the next event if any.
+                            if let Some(next_seqno) =
+                                this.get_closest_next_event(at_seqno, &snapshot)?
+                                && let OldEvent::Found(event) =
+                                    this.get_old_mc_block_event(next_seqno, Some(snapshot))?
+                            {
+                                let prev_seqno = at_seqno;
+                                let event_seqno = event.mc_block_id.seqno;
+                                debug_assert_eq!(event_seqno, next_seqno);
+
+                                // Some events were skipped.
+                                at_seqno = event_seqno.saturating_add(1);
+                                pending_event = Some(event);
+
+                                return Ok(Some(NewBlocksStreamItem::RangeSkipped(
+                                    SkippedBlocksRange {
+                                        mc_state_info: this.load_mc_state_info()?,
+                                        from: prev_seqno,
+                                        to: event_seqno.saturating_sub(1),
+                                    },
+                                )));
+                            }
+
+                            Ok::<_, StateError>(None)
+                        })();
+
+                        if let Some(event) = loaded.transpose() {
+                            break 'event event;
+                        }
+
+                        // The requested seqno is somewhere in the future or the db is empty.
+                        can_use_db = false;
+                        tokio::task::yield_now().await;
+                    }
+
+                    if let Some(event) = latest_event.borrow_and_update().clone() {
+                        let event_seqno = event.mc_block_id.seqno;
+                        match at_seqno.cmp(&event_seqno) {
+                            // Too old event was requested
+                            std::cmp::Ordering::Less if already_searched => {
+                                let prev_seqno = at_seqno;
+
+                                // Some events were skipped.
+                                at_seqno = event_seqno.saturating_add(1);
+                                let mc_state_info = event.mc_state_info;
+                                pending_event = Some(event);
+
+                                break 'event Ok(NewBlocksStreamItem::RangeSkipped(
+                                    SkippedBlocksRange {
+                                        mc_state_info,
+                                        from: prev_seqno,
+                                        to: event_seqno.saturating_sub(1),
+                                    },
+                                ));
+                            }
+                            // Try to search event in DB
+                            std::cmp::Ordering::Less => {
+                                can_use_db = true;
+                                continue 'outer;
+                            }
+                            // The exact event was found
+                            std::cmp::Ordering::Equal => {
+                                at_seqno = event_seqno.saturating_add(1);
+                                break 'event Ok(NewBlocksStreamItem::NewMcBlock(event));
+                            }
+                            // The requested event is in the future, need to wait
+                            std::cmp::Ordering::Greater => {}
+                        }
+                    }
+
+                    // Wait until the next event
+                    match latest_event.changed().await {
+                        Ok(()) => continue 'outer,
+                        Err(_) => return,
+                    }
+                };
+
+                if tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok(WithMcStateInfo::new(mc_state_info, ReceiverStream::new(rx)))
     }
 
     pub async fn get_block(&self, query: &QueryBlock) -> StateResult<Option<Box<BlockDataStream>>> {
         let this = self.inner.as_ref();
-        let mc_state_info = self.load_mc_state_info()?;
+        let mc_state_info = this.load_mc_state_info()?;
 
         let handles = this.storage.block_handle_storage();
         let blocks = this.storage.block_storage();
@@ -377,6 +477,8 @@ impl AppState {
         with_proof: bool,
         at_block: &AtBlock,
     ) -> StateResult<Option<AccessedShardAccount>> {
+        let this = self.inner.as_ref();
+
         // Find a cached state at the specified block.
         // TODO: Load state from disk if not cached?
         let cached = 'state: {
@@ -384,7 +486,7 @@ impl AppState {
             match at_block {
                 AtBlock::Latest => {
                     // NOTE: Keep the scope of `latest` as small as possible.
-                    let latest = self.inner.latest_states.load();
+                    let latest = this.latest_states.load();
                     let Some(latest) = latest.as_ref() else {
                         return Err(StateError::NotReady);
                     };
@@ -402,15 +504,14 @@ impl AppState {
                     mc_state_info = latest.mc_state.mc_state_info;
                 }
                 AtBlock::BySeqno(short_id) => {
-                    mc_state_info = self.load_mc_state_info()?;
-                    if let Some(cached) = self.inner.recent_states.read().get(short_id) {
+                    mc_state_info = this.load_mc_state_info()?;
+                    if let Some(cached) = this.recent_states.read().get(short_id) {
                         break 'state cached;
                     }
                 }
                 AtBlock::ById(block_id) => {
-                    mc_state_info = self.load_mc_state_info()?;
-                    if let Some(cached) =
-                        self.inner.recent_states.read().get(&block_id.as_short_id())
+                    mc_state_info = this.load_mc_state_info()?;
+                    if let Some(cached) = this.recent_states.read().get(&block_id.as_short_id())
                         && cached.state.block_id() == block_id
                     {
                         break 'state cached;
@@ -587,8 +688,8 @@ impl BlockSubscriber for AppState {
     fn prepare_block<'a>(&'a self, cx: &'a BlockSubscriberContext) -> Self::PrepareBlockFut<'a> {
         struct LatestBlockInfo {
             id: BlockId,
-            start_lt: u64,
             end_lt: u64,
+            gen_utime: u32,
             reg_mc_seqno: u32,
         }
 
@@ -630,8 +731,8 @@ impl BlockSubscriber for AppState {
                                 root_hash: descr.root_hash,
                                 file_hash: descr.file_hash,
                             },
-                            start_lt: descr.start_lt,
                             end_lt: descr.end_lt,
+                            gen_utime: descr.gen_utime,
                             reg_mc_seqno: descr.reg_mc_seqno,
                         })
                     }
@@ -672,8 +773,8 @@ impl BlockSubscriber for AppState {
             value.clear();
             value.extend_from_slice(block_id.root_hash.as_array());
             value.extend_from_slice(block_id.file_hash.as_array());
-            value.extend_from_slice(&info.start_lt.to_le_bytes());
             value.extend_from_slice(&info.end_lt.to_le_bytes());
+            value.extend_from_slice(&info.gen_utime.to_le_bytes());
             if let Some(shard_hashes) = &shard_hashes {
                 value.extend_from_slice(&(shard_hashes.len() as u32).to_le_bytes());
                 for item in shard_hashes {
@@ -682,8 +783,8 @@ impl BlockSubscriber for AppState {
                     value.extend_from_slice(&item.id.seqno.to_le_bytes());
                     value.extend_from_slice(item.id.root_hash.as_array());
                     value.extend_from_slice(item.id.file_hash.as_array());
-                    value.extend_from_slice(&item.start_lt.to_le_bytes());
                     value.extend_from_slice(&item.end_lt.to_le_bytes());
+                    value.extend_from_slice(&item.gen_utime.to_le_bytes());
                     value.extend_from_slice(&item.reg_mc_seqno.to_le_bytes());
                 }
             }
@@ -809,14 +910,13 @@ impl StateSubscriber for AppState {
             })));
 
             // Send event
-            this.new_mc_block_events
-                .send(Arc::new(NewMasterchainBlock {
+            this.latest_mc_block_event
+                .send_replace(Some(Arc::new(NewMasterchainBlock {
                     mc_state_info: mc_state.mc_state_info,
                     mc_block_id: *block_id,
                     shard_description,
                     shard_block_ids,
-                }))
-                .ok();
+                })));
 
             // Done
             Ok(())
@@ -836,7 +936,7 @@ struct Inner {
     subscriptions_semaphore: Arc<Semaphore>,
     db: TonApiDb,
     db_snapshot: ArcSwapOption<OwnedSnapshot>,
-    new_mc_block_events: broadcast::Sender<Arc<NewMasterchainBlock>>,
+    latest_mc_block_event: watch::Sender<Option<Arc<NewMasterchainBlock>>>,
     zerostate_id: ZerostateId,
     init_block_seqno: AtomicU32,
     gc_seqno_offset: u32,
@@ -845,6 +945,23 @@ struct Inner {
 }
 
 impl Inner {
+    fn is_ready(&self) -> bool {
+        self.is_ready.load(Ordering::Acquire)
+    }
+
+    fn load_mc_state_info(&self) -> Result<McStateInfo, StateError> {
+        let latest_mc_state = if self.is_ready() {
+            self.latest_states
+                .load()
+                .as_ref()
+                .map(|x| x.mc_state.mc_state_info)
+        } else {
+            None
+        };
+
+        latest_mc_state.ok_or(StateError::NotReady)
+    }
+
     async fn remove_known_blocks(&self, until_mc_seqno: u32) -> Result<bool> {
         tracing::info!(until_mc_seqno, "started known blocks gc");
         let started_at = Instant::now();
@@ -942,6 +1059,144 @@ impl Inner {
         })
         .await?
     }
+
+    fn get_closest_next_event(
+        &self,
+        mc_seqno: u32,
+        snapshot: &OwnedSnapshot,
+    ) -> Result<Option<u32>, StateError> {
+        let mut key = [0; tables::BlocksByMcSeqno::KEY_LEN];
+        key[0..4].copy_from_slice(&mc_seqno.to_be_bytes());
+
+        let mut readopts = self.db.blocks_by_mc_seqno.new_read_config();
+        readopts.set_snapshot(snapshot);
+        readopts.set_iterate_lower_bound(key.as_slice());
+
+        let mut iter = self
+            .db
+            .rocksdb()
+            .raw_iterator_cf_opt(&self.db.blocks_by_mc_seqno.cf(), readopts);
+        iter.seek_to_first();
+
+        match iter.key() {
+            Some(key) => {
+                let seqno = u32::from_be_bytes(key[0..4].try_into().unwrap());
+                Ok(Some(seqno))
+            }
+            None => match iter.status() {
+                Ok(()) => Ok(None),
+                Err(e) => Err(StateError::Internal(e.into())),
+            },
+        }
+    }
+
+    fn get_old_mc_block_event(
+        &self,
+        mc_seqno: u32,
+        snapshot: Option<Arc<OwnedSnapshot>>,
+    ) -> Result<OldEvent, StateError> {
+        let mc_state_info = self.load_mc_state_info()?;
+        let Some(snapshot) = snapshot.or_else(|| self.db_snapshot.load_full()) else {
+            return Err(StateError::NotReady);
+        };
+
+        let mut key = [0; tables::BlocksByMcSeqno::KEY_LEN];
+        key[0..4].copy_from_slice(&mc_seqno.to_be_bytes());
+
+        let mut readopts = self.db.blocks_by_mc_seqno.new_read_config();
+        readopts.set_snapshot(&snapshot);
+        readopts.set_iterate_lower_bound(key.as_slice());
+        key[0..4].copy_from_slice(&mc_seqno.saturating_add(1).to_be_bytes());
+        readopts.set_iterate_upper_bound(key.as_slice());
+
+        let mut iter = self
+            .db
+            .rocksdb()
+            .raw_iterator_cf_opt(&self.db.blocks_by_mc_seqno.cf(), readopts);
+        iter.seek_to_first();
+
+        let mut shard_block_ids = Vec::new();
+        let mut shard_description = Vec::new();
+
+        'items: loop {
+            let (key, mut value) = match iter.item() {
+                Some(item) => item,
+                None => match iter.status() {
+                    // No items found.
+                    Ok(()) if shard_block_ids.is_empty() => break 'items,
+                    // We would have exited on a masterchain block if there was any.
+                    Ok(()) => {
+                        return Err(StateError::Internal(anyhow!(
+                            "inconsistent `blocks_by_mc_seqno` state for block {}:{mc_seqno}",
+                            ShardIdent::MASTERCHAIN
+                        )));
+                    }
+                    Err(e) => return Err(StateError::Internal(e.into())),
+                },
+            };
+
+            let shard = ShardIdent::new(
+                key[4] as i8 as i32,
+                u64::from_be_bytes(key[5..13].try_into().unwrap()),
+            )
+            .expect("db must store a valid shard");
+
+            let block_id = BlockId {
+                shard,
+                seqno: u32::from_be_bytes(key[13..17].try_into().unwrap()),
+                root_hash: HashBytes::from_slice(&value[0..32]),
+                file_hash: HashBytes::from_slice(&value[32..64]),
+            };
+
+            if block_id.is_masterchain() {
+                debug_assert_eq!(
+                    block_id.seqno, mc_seqno,
+                    "masterchain block must be referenced by itself",
+                );
+
+                const OFFSET: usize = tables::BlocksByMcSeqno::SHARD_HASHES_OFFSET;
+
+                let shard_count = u32::from_le_bytes(value[OFFSET..OFFSET + 4].try_into().unwrap());
+                value = &value[OFFSET + 4..];
+                for _ in 0..shard_count {
+                    let shard = ShardIdent::new(
+                        value[0] as i8 as i32,
+                        u64::from_le_bytes(value[1..9].try_into().unwrap()),
+                    )
+                    .expect("db must store a valid shard");
+                    let seqno = u32::from_le_bytes(value[9..13].try_into().unwrap());
+
+                    shard_description.push(BriefShardDescription {
+                        block_id: BlockId {
+                            shard,
+                            seqno,
+                            root_hash: HashBytes::from_slice(&value[13..45]),
+                            file_hash: HashBytes::from_slice(&value[45..77]),
+                        },
+                        end_lt: u64::from_le_bytes(value[77..85].try_into().unwrap()),
+                        gen_utime: u32::from_le_bytes(value[85..89].try_into().unwrap()),
+                        reg_mc_seqno: u32::from_le_bytes(value[89..93].try_into().unwrap()),
+                    });
+
+                    // Move to the next shard description
+                    value = &value[tables::BlocksByMcSeqno::SHARD_HASHES_ITEM_LEN..];
+                }
+
+                return Ok(OldEvent::Found(Arc::new(NewMasterchainBlock {
+                    mc_state_info,
+                    mc_block_id: block_id,
+                    shard_description,
+                    shard_block_ids,
+                })));
+            } else {
+                shard_block_ids.push(block_id);
+            }
+
+            iter.next();
+        }
+
+        return Ok(OldEvent::NotFound(snapshot));
+    }
 }
 
 impl Drop for Inner {
@@ -950,6 +1205,11 @@ impl Drop for Inner {
             handle.abort();
         }
     }
+}
+
+enum OldEvent {
+    Found(Arc<NewMasterchainBlock>),
+    NotFound(Arc<OwnedSnapshot>),
 }
 
 struct LatestStates {
@@ -1138,36 +1398,7 @@ pub enum NewBlocksStreamItem {
     RangeSkipped(SkippedBlocksRange),
 }
 
-pub struct NewBlocksStream {
-    inner: Arc<Inner>,
-    new_blocks: BroadcastStream<Arc<NewMasterchainBlock>>,
-    _permit: OwnedSemaphorePermit,
-}
-
-impl Stream for NewBlocksStream {
-    type Item = NewBlocksStreamItem;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-
-        loop {
-            match self.new_blocks.poll_next_unpin(cx) {
-                // New event without lagging.
-                Poll::Ready(Some(Ok(item))) => {
-                    return Poll::Ready(Some(NewBlocksStreamItem::NewMcBlock(item)));
-                }
-                // Some blocks were skipped, we need to load them from DB or send a "skipped" event.
-                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {
-                    // TODO: Load from db.
-                    continue;
-                }
-                // Should not really happen
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
+pub type NewBlocksStream = ReceiverStream<Result<NewBlocksStreamItem, StateError>>;
 
 pub struct BlockDataStream {
     total_size: u64,

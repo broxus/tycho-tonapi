@@ -59,8 +59,7 @@ message BlocksRangeSkipped {
 }
 
 message NewMasterchainBlock {
-    // Brief masterchain info at the moment of accessing the state
-    // (equals to the state at `mcBlockId`).
+    // Brief masterchain info at the moment of accessing the state.
     McStateInfo mcStateInfo = 1;
     // The id of the masterchain block.
     BlockId mcBlockId = 2;

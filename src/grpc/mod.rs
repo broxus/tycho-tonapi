@@ -47,11 +47,14 @@ impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
         &self,
         request: tonic::Request<proto::WatchBlockIdsRequest>,
     ) -> tonic::Result<tonic::Response<Self::WatchBlockIdsStream>> {
-        // TODO: Use seqno from request
+        let res = self
+            .state
+            .watch_new_blocks(request.get_ref().since_mc_seqno)
+            .await?;
 
-        let res = self.state.watch_new_blocks().await?;
         Ok(tonic::Response::new(WatchBlockIdsStream {
             inner: res.data,
+            broken: false,
         }))
     }
 
@@ -152,6 +155,7 @@ impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
 
 pub struct WatchBlockIdsStream {
     inner: crate::state::NewBlocksStream,
+    broken: bool,
 }
 
 impl tokio_stream::Stream for WatchBlockIdsStream {
@@ -161,8 +165,20 @@ impl tokio_stream::Stream for WatchBlockIdsStream {
         use self::proto::watch_block_ids_event::Event;
         use crate::state::NewBlocksStreamItem;
 
-        let Some(item) = ready!(self.inner.poll_next_unpin(cx)) else {
+        if self.broken {
             return Poll::Ready(None);
+        }
+
+        let Some(res) = ready!(self.inner.poll_next_unpin(cx)) else {
+            return Poll::Ready(None);
+        };
+
+        let item = match res {
+            Ok(item) => item,
+            Err(e) => {
+                self.broken = true;
+                return Poll::Ready(Some(Err(e.into())));
+            }
         };
 
         let event = match item {
