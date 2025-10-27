@@ -1,7 +1,10 @@
+use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
+use bytesize::ByteSize;
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use tokio_stream::Stream;
 use tycho_types::cell::HashBytes;
 use tycho_types::models::{BlockIdShort, ShardIdent, StdAddr};
@@ -10,6 +13,50 @@ use crate::state::{AppState, StateError};
 
 pub mod proto {
     tonic::include_proto!("indexer");
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GrpcConfig {
+    /// gRPC server listen address.
+    ///
+    /// Default: `0.0.0.0:50051`
+    pub listen_addr: SocketAddr,
+    /// Max query/answer message size.
+    ///
+    /// Default: `4 MiB`
+    pub max_message_size: ByteSize,
+}
+
+impl Default for GrpcConfig {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            listen_addr: (Ipv4Addr::UNSPECIFIED, 50051).into(),
+            max_message_size: ByteSize::mib(4),
+        }
+    }
+}
+
+pub async fn serve(state: AppState, config: GrpcConfig) -> anyhow::Result<()> {
+    use tonic::codec::CompressionEncoding;
+
+    let server_impl = GrpcServer::new(state.clone());
+
+    let service = proto::tycho_indexer_server::TychoIndexerServer::new(server_impl)
+        .max_encoding_message_size(config.max_message_size.as_u64() as usize)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Deflate)
+        .accept_compressed(CompressionEncoding::Zstd)
+        .send_compressed(CompressionEncoding::Gzip)
+        .send_compressed(CompressionEncoding::Deflate)
+        .send_compressed(CompressionEncoding::Zstd);
+
+    let server = tonic::transport::Server::builder()
+        .add_service(service)
+        .serve(config.listen_addr);
+
+    server.await.map_err(Into::into)
 }
 
 // === Service ===

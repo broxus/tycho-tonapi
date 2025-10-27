@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -11,6 +11,7 @@ use tycho_core::block_strider::{
 use tycho_core::blockchain_rpc::NoopBroadcastListener;
 use tycho_core::global_config::GlobalConfig;
 use tycho_core::node::{NodeBase, NodeBaseConfig, NodeKeys};
+use tycho_tonapi::grpc::GrpcConfig;
 use tycho_tonapi::state::{AppState, AppStateConfig};
 use tycho_util::cli;
 use tycho_util::cli::config::ThreadPoolConfig;
@@ -131,14 +132,7 @@ impl Cmd {
 
         // Bind gRPC
         let _grpc_task = {
-            use tycho_tonapi::grpc;
-
-            let server_impl = grpc::GrpcServer::new(state.clone());
-            let server = tonic::transport::Server::builder()
-                .add_service(grpc::proto::tycho_indexer_server::TychoIndexerServer::new(
-                    server_impl,
-                ))
-                .serve(node_config.grpc.listen_addr);
+            let server = tycho_tonapi::grpc::serve(state.clone(), node_config.grpc.clone());
 
             JoinTask::new(async move {
                 if let Err(e) = server.await {
@@ -217,20 +211,6 @@ impl Default for NodeConfig {
             metrics: Some(MetricsConfig::default()),
             app: AppStateConfig::default(),
             grpc: GrpcConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrpcConfig {
-    pub listen_addr: SocketAddr,
-}
-
-impl Default for GrpcConfig {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            listen_addr: (Ipv4Addr::LOCALHOST, 50051).into(),
         }
     }
 }
