@@ -3210,6 +3210,7 @@ dependencies = [
  "clap",
  "ctr",
  "futures-util",
+ "hex",
  "humantime",
  "moka",
  "parking_lot",

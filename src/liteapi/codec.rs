@@ -6,9 +6,10 @@ use bytes::{Buf, Bytes, BytesMut};
 use ctr::Ctr128BE;
 use rand::Rng;
 use sha2::{Digest, Sha256};
+use tl_proto::TlWrite;
 use tokio_util::codec::{Decoder, Encoder};
 
-use super::AdnlError;
+use super::{AdnlError, proto};
 
 pub type TcpAdnlCipher = Ctr128BE<Aes256>;
 
@@ -58,31 +59,21 @@ impl rand::distr::Distribution<AesParams> for rand::distr::StandardUniform {
     }
 }
 
-pub struct TcpAdnlCodec {
+pub struct TcpAdnlDecoder {
     rx_cipher: TcpAdnlCipher,
-    tx_cipher: TcpAdnlCipher,
     packet_len: Option<usize>,
 }
 
-impl TcpAdnlCodec {
-    pub fn client(params: &AesParams) -> Self {
-        Self {
-            rx_cipher: TcpAdnlCipher::new(params.rx_key().into(), params.rx_nonce().into()),
-            tx_cipher: TcpAdnlCipher::new(params.tx_key().into(), params.tx_nonce().into()),
-            packet_len: None,
-        }
-    }
-
+impl TcpAdnlDecoder {
     pub fn server(aes_params: &AesParams) -> Self {
         Self {
             rx_cipher: TcpAdnlCipher::new(aes_params.tx_key().into(), aes_params.tx_nonce().into()),
-            tx_cipher: TcpAdnlCipher::new(aes_params.rx_key().into(), aes_params.rx_nonce().into()),
             packet_len: None,
         }
     }
 }
 
-impl Decoder for TcpAdnlCodec {
+impl Decoder for TcpAdnlDecoder {
     type Item = Bytes;
     type Error = AdnlError;
 
@@ -127,27 +118,73 @@ impl Decoder for TcpAdnlCodec {
     }
 }
 
-impl Encoder<Bytes> for TcpAdnlCodec {
+pub struct TcpAdnlEncoder {
+    tx_cipher: TcpAdnlCipher,
+}
+
+impl TcpAdnlEncoder {
+    pub fn server(aes_params: &AesParams) -> Self {
+        Self {
+            tx_cipher: TcpAdnlCipher::new(aes_params.rx_key().into(), aes_params.rx_nonce().into()),
+        }
+    }
+}
+
+impl Encoder<Bytes> for TcpAdnlEncoder {
     type Error = AdnlError;
 
-    fn encode(&mut self, packet: Bytes, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        if packet.len() > MAX_PACKET_LEN {
-            return Err(AdnlError::TooBigPacket(packet.len()));
+    fn encode(&mut self, item: Bytes, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        if item.len() > MAX_PACKET_LEN {
+            return Err(AdnlError::TooBigPacket(item.len()));
         }
 
-        let length = (packet.len() + 64) as u32;
+        let length = (item.len() + 64) as u32;
         let nonce = rand::random::<[u8; 32]>();
 
-        dst.reserve(packet.len() + 4 + 32 + 32);
+        dst.reserve(item.len() + 4 + 32 + 32);
 
         let encrypt_from = dst.len();
         dst.extend_from_slice(&length.to_le_bytes());
         let hash_from = dst.len();
         dst.extend_from_slice(&nonce);
-        dst.extend_from_slice(&packet);
+        dst.extend_from_slice(&item);
 
         let hash = Sha256::digest(&dst[hash_from..]);
         dst.extend_from_slice(&hash);
+
+        self.tx_cipher.apply_keystream(&mut dst[encrypt_from..]);
+        Ok(())
+    }
+}
+
+impl Encoder<&'_ proto::AdnlAnswer> for TcpAdnlEncoder {
+    type Error = AdnlError;
+
+    fn encode(
+        &mut self,
+        item: &'_ proto::AdnlAnswer,
+        dst: &mut BytesMut,
+    ) -> Result<(), Self::Error> {
+        let data_len = item.max_size_hint();
+        if data_len > MAX_PACKET_LEN {
+            return Err(AdnlError::TooBigPacket(data_len));
+        }
+
+        let length = (data_len + 64) as u32;
+        let nonce = rand::random::<[u8; 32]>();
+
+        dst.reserve(data_len + 4 + 32 + 32);
+
+        let encrypt_from = dst.len();
+        dst.extend_from_slice(&length.to_le_bytes());
+        let hash_from = dst.len();
+        dst.extend_from_slice(&nonce);
+        item.write_to(dst);
+
+        let hash = Sha256::digest(&dst[hash_from..]);
+        dst.extend_from_slice(&hash);
+
+        debug_assert_eq!(dst.len(), hash_from + length as usize);
 
         self.tx_cipher.apply_keystream(&mut dst[encrypt_from..]);
         Ok(())

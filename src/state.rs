@@ -274,6 +274,19 @@ impl AppState {
         }
     }
 
+    pub fn get_latest_mc_info(&self) -> Option<LatestMasterchainInfo> {
+        let this = self.inner.as_ref();
+        this.latest_states
+            .load()
+            .as_ref()
+            .map(|state| LatestMasterchainInfo {
+                last_block_id: *state.mc_state.state.block_id(),
+                last_block_utime: state.mc_state.mc_state_info.utime,
+                state_root_hash: *state.mc_state.state.root_cell().repr_hash(),
+                zerostate_id: this.zerostate_id,
+            })
+    }
+
     pub fn is_ready(&self) -> bool {
         self.inner.is_ready()
     }
@@ -560,6 +573,7 @@ impl AppState {
 
         let mc_state_info = cached.mc_state_info;
 
+        let block_id = *cached.state.block_id();
         let (account_state, proof) = if with_proof {
             let address = address.clone();
             let db = self.inner.db.clone();
@@ -657,6 +671,7 @@ impl AppState {
         Ok(WithMcStateInfo::new(
             mc_state_info,
             Some(AccessedShardAccount {
+                block_id,
                 account_state: account_state.map(Bytes::from),
                 proof: proof.map(Bytes::from),
             }),
@@ -1359,7 +1374,16 @@ pub struct AppStatus {
     pub init_block_seqno: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct LatestMasterchainInfo {
+    pub last_block_id: BlockId,
+    pub last_block_utime: u32,
+    pub state_root_hash: HashBytes,
+    pub zerostate_id: ZerostateId,
+}
+
 pub struct AccessedShardAccount {
+    pub block_id: BlockId,
     pub account_state: Option<Bytes>,
     pub proof: Option<Bytes>,
 }
@@ -1463,6 +1487,10 @@ impl BlockDataStream {
     #[inline]
     pub fn block_id(&self) -> &BlockId {
         &self.block_id
+    }
+
+    pub fn into_inner(self) -> Bytes {
+        self.data
     }
 }
 
