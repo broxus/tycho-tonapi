@@ -23,6 +23,7 @@ scopeguard = "1.2.0"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2.0"
+tl-proto = { version = "0.5.4", features = ["bytes"] }
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-util = "0.7.16"

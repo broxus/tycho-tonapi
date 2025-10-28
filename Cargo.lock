@@ -2718,9 +2718,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tl-proto"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa0cfc23477a4135cb40334544c149647f26239c83034ab01049f384528af4c5"
+checksum = "ce1835e6f318b9a4d93f949c68afa6b7475f37b7cfef3640bfde9132eeb53202"
 dependencies = [
  "bytes",
  "digest",
@@ -2732,9 +2732,9 @@ dependencies = [
 
 [[package]]
 name = "tl-proto-proc"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "031cadd2049e03a287e8ac7663b5968cda07d7d10dd5b1cd734ebe234d135bb8"
+checksum = "d5befd708aeec539f76e4db4c850567026dac292569ff731de600b7cd7aaab3b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3221,6 +3221,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.17",
  "tikv-jemallocator",
+ "tl-proto",
  "tokio",
  "tokio-stream",
  "tokio-util",

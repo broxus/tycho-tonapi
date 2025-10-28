@@ -1,5 +1,6 @@
 pub mod codec;
 pub mod connection;
+pub mod proto;
 
 #[derive(thiserror::Error, Debug)]
 pub enum AdnlError {

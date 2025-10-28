@@ -38,7 +38,6 @@ liteServer.shardInfo id:tonNode.blockIdExt shardblk:tonNode.blockIdExt shard_pro
 liteServer.allShardsInfo id:tonNode.blockIdExt proof:bytes data:bytes = liteServer.AllShardsInfo;
 liteServer.libraryResult result:(vector liteServer.libraryEntry) = liteServer.LibraryResult;
 liteServer.shardBlockLink id:tonNode.blockIdExt proof:bytes = liteServer.ShardBlockLink;
-liteServer.lookupBlockResult id:tonNode.blockIdExt mode:# mc_block_id:tonNode.blockIdExt client_mc_state_proof:bytes mc_block_proof:bytes shard_links:(vector liteServer.shardBlockLink) header:bytes prev_header:bytes = liteServer.LookupBlockResult;
 
 
 ---functions---
@@ -48,12 +47,10 @@ liteServer.getMasterchainInfoExt mode:# = liteServer.MasterchainInfoExt;
 liteServer.getTime = liteServer.CurrentTime;
 liteServer.getVersion = liteServer.Version;
 liteServer.getBlock id:tonNode.blockIdExt = liteServer.BlockData;
-liteServer.getBlockHeader id:tonNode.blockIdExt mode:# = liteServer.BlockHeader;
 liteServer.getAccountState id:tonNode.blockIdExt account:liteServer.accountId = liteServer.AccountState;
 liteServer.getShardInfo id:tonNode.blockIdExt workchain:int shard:long exact:Bool = liteServer.ShardInfo;
 liteServer.getAllShardsInfo id:tonNode.blockIdExt = liteServer.AllShardsInfo;
 liteServer.lookupBlock mode:# id:tonNode.blockId lt:mode.1?long utime:mode.2?int = liteServer.BlockHeader;
-liteServer.lookupBlockWithProof mode:# id:tonNode.blockId mc_block_id:tonNode.blockIdExt lt:mode.1?long utime:mode.2?int = liteServer.LookupBlockResult;
 liteServer.getLibraries library_list:(vector int256) = liteServer.LibraryResult;
 
 liteServer.queryPrefix = Object;
