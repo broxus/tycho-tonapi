@@ -15,6 +15,8 @@ vector {t:Type} # [ t ] = Vector t;
 int128 4*[ int ] = Int128;
 int256 8*[ int ] = Int256;
 
+tcp.pong random_id:long = tcp.Pong;
+
 tonNode.blockId workchain:int shard:long seqno:int = tonNode.BlockId;
 tonNode.blockIdExt workchain:int shard:long seqno:int root_hash:int256 file_hash:int256 = tonNode.BlockIdExt;
 tonNode.zeroStateIdExt workchain:int root_hash:int256 file_hash:int256 = tonNode.ZeroStateIdExt;
@@ -41,6 +43,8 @@ liteServer.shardBlockLink id:tonNode.blockIdExt proof:bytes = liteServer.ShardBl
 
 
 ---functions---
+
+tcp.ping random_id:long = tcp.Pong;
 
 liteServer.getMasterchainInfo = liteServer.MasterchainInfo;
 liteServer.getMasterchainInfoExt mode:# = liteServer.MasterchainInfoExt;

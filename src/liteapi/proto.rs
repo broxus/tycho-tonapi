@@ -42,7 +42,9 @@ pub mod rpc {
         id = "liteServer.getMasterchainInfoExt",
         scheme = "../proto/lite_api.tl"
     )]
-    pub struct GetMasterchainInfoExtRequest;
+    pub struct GetMasterchainInfoExtRequest {
+        pub mode: i32,
+    }
 
     #[derive(Debug, TlRead, TlWrite)]
     #[tl(
@@ -50,7 +52,20 @@ pub mod rpc {
         id = "liteServer.masterchainInfoExt",
         scheme = "../proto/lite_api.tl"
     )]
-    pub struct GetMasterchainInfoExtResponse;
+    pub struct GetMasterchainInfoExtResponse {
+        pub mode: i32,
+        pub version: u32,
+        pub capabilities: u64,
+        #[tl(with = "block_id")]
+        pub last: BlockId,
+        pub last_utime: u32,
+        pub now: u32,
+        #[tl(with = "hash_bytes")]
+        pub state_root_hash: HashBytes,
+        pub init_workchain: i32,
+        #[tl(with = "zerostate_id")]
+        pub init_zerostate_id: ZerostateId,
+    }
 
     // === liteServer.getTime ===
 
@@ -118,7 +133,7 @@ pub mod rpc {
         pub id: BlockId,
         #[tl(with = "block_id")]
         pub shard_block_id: BlockId,
-        pub shard_proot: Bytes,
+        pub shard_proof: Bytes,
         pub proof: Bytes,
         pub state: Bytes,
     }
@@ -201,7 +216,7 @@ pub mod rpc {
     #[derive(Debug, TlRead, TlWrite)]
     #[tl(boxed, id = "liteServer.getLibraries", scheme = "../proto/lite_api.tl")]
     pub struct GetLibrariesRequest {
-        #[tl(with = "hash_bytes_vec")]
+        #[tl(with = "HashBytesVec::<16>")]
         pub library_list: Vec<HashBytes>,
     }
 
@@ -217,11 +232,23 @@ pub mod rpc {
 }
 
 #[derive(Debug, TlRead, TlWrite)]
+#[tl(boxed, id = "tcp.ping", scheme = "../proto/lite_api.tl")]
+pub struct TcpPing {
+    pub random_id: u64,
+}
+
+#[derive(Debug, TlRead, TlWrite)]
+#[tl(boxed, id = "tcp.pong", scheme = "../proto/lite_api.tl")]
+pub struct TcpPong {
+    pub random_id: u64,
+}
+
+#[derive(Debug, TlRead, TlWrite)]
 #[tl(boxed, id = "adnl.message.query", scheme = "../proto/lite_api.tl")]
-pub struct AdnlQuery {
+pub struct AdnlQuery<'tl> {
     #[tl(with = "hash_bytes")]
     pub query_id: HashBytes,
-    pub query: Bytes,
+    pub query: &'tl [u8],
 }
 
 #[derive(Debug, TlRead, TlWrite)]
@@ -240,8 +267,14 @@ pub struct LiteServerError {
 }
 
 #[derive(TlRead, TlWrite)]
+#[tl(boxed, id = "liteServer.query", scheme = "../proto/lite_api.tl")]
+pub struct LiteServerQuery<'tl> {
+    pub data: &'tl [u8],
+}
+
+#[derive(TlRead, TlWrite)]
 #[tl(boxed, id = "liteServer.queryPrefix", scheme = "../proto/lite_api.tl")]
-pub struct QueryPrefix;
+pub struct LiteServerQueryPrefix;
 
 #[derive(Debug, TlRead, TlWrite)]
 #[tl(
@@ -331,9 +364,9 @@ pub mod block_id_short {
     }
 }
 
-pub mod hash_bytes_vec {
-    use super::*;
+struct HashBytesVec<const MAX_LEN: usize>;
 
+impl<const MAX_LEN: usize> HashBytesVec<MAX_LEN> {
     pub fn size_hint(ids: &[HashBytes]) -> usize {
         4 + ids.len() * hash_bytes::SIZE_HINT
     }
@@ -347,6 +380,9 @@ pub mod hash_bytes_vec {
 
     pub fn read(packet: &mut &[u8]) -> TlResult<Vec<HashBytes>> {
         let len = u32::read_from(packet)?;
+        if len as usize > MAX_LEN {
+            return Err(TlError::InvalidData);
+        }
         if packet.len() < len as usize * hash_bytes::SIZE_HINT {
             return Err(TlError::UnexpectedEof);
         }
@@ -357,4 +393,13 @@ pub mod hash_bytes_vec {
         }
         Ok(items)
     }
+}
+
+pub fn deserialize_exact<'a, T: TlRead<'a>>(data: &'a [u8]) -> TlResult<T> {
+    let bytes = &mut data.as_ref();
+    let parsed = T::read_from(bytes)?;
+    if !bytes.is_empty() {
+        return Err(TlError::InvalidData);
+    }
+    Ok(parsed)
 }

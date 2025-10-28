@@ -274,6 +274,19 @@ impl AppState {
         }
     }
 
+    pub fn get_latest_mc_info(&self) -> Option<LatestMasterchainInfo> {
+        let this = self.inner.as_ref();
+        this.latest_states
+            .load()
+            .as_ref()
+            .map(|state| LatestMasterchainInfo {
+                last_block_id: *state.mc_state.state.block_id(),
+                last_block_utime: state.mc_state.mc_state_info.utime,
+                state_root_hash: *state.mc_state.state.root_cell().repr_hash(),
+                zerostate_id: this.zerostate_id,
+            })
+    }
+
     pub fn is_ready(&self) -> bool {
         self.inner.is_ready()
     }
@@ -482,6 +495,29 @@ impl AppState {
         // Find a cached state at the specified block.
         // TODO: Load state from disk if not cached?
         let cached = 'state: {
+            let resolve = |cached: Arc<CachedState>| {
+                let cached_block_id = cached.state.block_id();
+                let address_workchain = address.workchain;
+
+                if cached_block_id.shard.workchain() == address_workchain as i32 {
+                    if cached_block_id.shard.contains_address(address) {
+                        Ok(cached)
+                    } else {
+                        Err(StateError::Internal(anyhow!(
+                            "requested account id is not contained in the shard of the reference block"
+                        )))
+                    }
+                } else if cached_block_id.is_masterchain() {
+                    // TODO
+
+                    Ok(())
+                } else {
+                    Err(StateError::Internal(anyhow!(
+                        "reference block must belong to the masterchain"
+                    )))
+                }
+            };
+
             let mc_state_info;
             match at_block {
                 AtBlock::Latest => {
@@ -896,6 +932,10 @@ impl StateSubscriber for AppState {
                     CachedState::for_shard(state, mc_state.mc_state_info).map(Arc::new)
                 })
                 .collect::<Result<Vec<_>>>()?;
+
+            this.recent_states
+                .write()
+                .push(mc_state.clone(), new_shard_states.clone());
 
             // Update the latest states
             this.latest_states.store(Some(Arc::new(LatestStates {
@@ -1345,6 +1385,14 @@ pub struct AppStatus {
     pub init_block_seqno: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct LatestMasterchainInfo {
+    pub last_block_id: BlockId,
+    pub last_block_utime: u32,
+    pub state_root_hash: HashBytes,
+    pub zerostate_id: ZerostateId,
+}
+
 pub struct AccessedShardAccount {
     pub account_state: Option<Bytes>,
     pub proof: Option<Bytes>,
@@ -1424,6 +1472,10 @@ impl BlockDataStream {
     #[inline]
     pub fn block_id(&self) -> &BlockId {
         &self.block_id
+    }
+
+    pub fn into_inner(self) -> Bytes {
+        self.data
     }
 }
 

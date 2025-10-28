@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -11,7 +12,9 @@ use tycho_core::block_strider::{
 use tycho_core::blockchain_rpc::NoopBroadcastListener;
 use tycho_core::global_config::GlobalConfig;
 use tycho_core::node::{NodeBase, NodeBaseConfig, NodeKeys};
+use tycho_crypto::ed25519;
 use tycho_tonapi::grpc::GrpcConfig;
+use tycho_tonapi::liteapi::LiteServerConfig;
 use tycho_tonapi::state::{AppState, AppStateConfig};
 use tycho_util::cli;
 use tycho_util::cli::config::ThreadPoolConfig;
@@ -142,6 +145,23 @@ impl Cmd {
             })
         };
 
+        // Bind LiteServer
+        let _lite_server = if let Some(config) = node_config.liteapi {
+            // TODO: Use separate keypair for lite server
+            let keypair = Arc::new(ed25519::KeyPair::from(&keys.as_secret()));
+            let server =
+                tycho_tonapi::liteapi::LiteServer::bind(state.clone(), keypair, config).await?;
+
+            Some(JoinTask::new(async move {
+                if let Err(e) = server.serve().await {
+                    // TODO: Stop the node on server error
+                    tracing::error!("lite server stopped with error: {e:?}");
+                }
+            }))
+        } else {
+            None
+        };
+
         // Sync node.
         let init_block_id = node
             .init(ColdBootType::LatestPersistent, self.import_zerostate, None)
@@ -200,6 +220,8 @@ struct NodeConfig {
     app: AppStateConfig,
     #[important]
     grpc: GrpcConfig,
+    #[important]
+    liteapi: Option<LiteServerConfig>,
 }
 
 impl Default for NodeConfig {
@@ -211,6 +233,7 @@ impl Default for NodeConfig {
             metrics: Some(MetricsConfig::default()),
             app: AppStateConfig::default(),
             grpc: GrpcConfig::default(),
+            liteapi: None,
         }
     }
 }

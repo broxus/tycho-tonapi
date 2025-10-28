@@ -1,5 +1,4 @@
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use aes::cipher::{KeyIvInit, StreamCipher};
@@ -7,38 +6,64 @@ use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio_util::codec::{Decoder, Framed};
+use tokio_util::codec::{FramedRead, FramedWrite};
 use tycho_crypto::ed25519;
 use tycho_types::cell::HashBytes;
 
 use super::AdnlError;
-use super::codec::{AesParams, TcpAdnlCipher, TcpAdnlCodec};
+use super::codec::{AesParams, TcpAdnlCipher, TcpAdnlDecoder, TcpAdnlEncoder};
 
 pin_project_lite::pin_project! {
-    pub struct AdnlConnection<T> {
-        peer_id: HashBytes,
+    pub struct AdnlConnection<I, O> {
+        pub peer_id: HashBytes,
         #[pin]
-        stream: Framed<T, TcpAdnlCodec>,
+        pub rx: FramedRead<I, TcpAdnlDecoder>,
+        #[pin]
+        pub tx: FramedWrite<O, TcpAdnlEncoder>,
     }
 }
 
-impl<T> AdnlConnection<T>
+pub trait ResolveReceiver {
+    fn resolve_receiver<'s, 'i>(&'s self, id: &'i [u8; 32]) -> Option<&'s ed25519::KeyPair>;
+}
+
+impl<T: ResolveReceiver> ResolveReceiver for &'_ T {
+    #[inline]
+    fn resolve_receiver<'s, 'i>(&'s self, id: &'i [u8; 32]) -> Option<&'s ed25519::KeyPair> {
+        T::resolve_receiver(*self, id)
+    }
+}
+
+impl ResolveReceiver for ed25519::KeyPair {
+    #[inline]
+    fn resolve_receiver<'s, 'i>(&'s self, _: &'i [u8; 32]) -> Option<&'s ed25519::KeyPair> {
+        Some(self)
+    }
+}
+
+impl<I, O> AdnlConnection<I, O>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    I: AsyncRead + Unpin,
+    O: AsyncWrite + Unpin,
 {
-    pub async fn accept<F>(mut transport: T, resolve_receiver: F) -> Result<Self, AdnlError>
-    where
-        F: Fn(&[u8; 32]) -> Option<Arc<ed25519::KeyPair>>,
-    {
-        let Handshake { peer_id, codec } =
-            Handshake::receive(&mut transport, resolve_receiver).await?;
+    pub async fn accept<R: ResolveReceiver>(
+        mut rx: I,
+        tx: O,
+        resolver: R,
+    ) -> Result<Self, AdnlError> {
+        let Handshake {
+            peer_id,
+            decoder,
+            encoder,
+        } = Handshake::receive(&mut rx, resolver).await?;
 
         let mut server = Self {
             peer_id,
-            stream: codec.framed(transport),
+            rx: FramedRead::new(rx, decoder),
+            tx: FramedWrite::new(tx, encoder),
         };
 
-        server.send(Bytes::new()).await?;
+        server.tx.send(Bytes::new()).await?;
 
         Ok(server)
     }
@@ -48,53 +73,59 @@ where
     }
 }
 
-impl<T> Stream for AdnlConnection<T>
+impl<I, O> Stream for AdnlConnection<I, O>
 where
-    T: AsyncRead + AsyncWrite,
+    I: AsyncRead,
 {
     type Item = Result<Bytes, AdnlError>;
 
+    #[inline]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.project().stream.poll_next(cx)
+        self.project().rx.poll_next(cx)
     }
 }
 
-impl<T> Sink<Bytes> for AdnlConnection<T>
+impl<I, O> Sink<Bytes> for AdnlConnection<I, O>
 where
-    T: AsyncWrite + AsyncRead,
+    O: AsyncWrite,
 {
     type Error = AdnlError;
 
+    #[inline]
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project().stream.poll_ready(cx)
+        Sink::<Bytes>::poll_ready(self.project().tx, cx)
     }
 
+    #[inline]
     fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
-        self.project().stream.start_send(item)
+        Sink::<Bytes>::start_send(self.project().tx, item)
     }
 
+    #[inline]
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project().stream.poll_flush(cx)
+        Sink::<Bytes>::poll_flush(self.project().tx, cx)
     }
 
+    #[inline]
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project().stream.poll_close(cx)
+        Sink::<Bytes>::poll_close(self.project().tx, cx)
     }
 }
 
 struct Handshake {
     peer_id: HashBytes,
-    codec: TcpAdnlCodec,
+    decoder: TcpAdnlDecoder,
+    encoder: TcpAdnlEncoder,
 }
 
 impl Handshake {
-    async fn receive<T, F>(transport: &mut T, resolve_receiver: F) -> Result<Self, AdnlError>
+    async fn receive<T, R>(rx: &mut T, resolver: R) -> Result<Self, AdnlError>
     where
         T: AsyncReadExt + Unpin,
-        F: Fn(&[u8; 32]) -> Option<Arc<ed25519::KeyPair>>,
+        R: ResolveReceiver,
     {
         let mut handshake = [0u8; 256];
-        transport.read_exact(&mut handshake).await?;
+        rx.read_exact(&mut handshake).await?;
 
         let receiver: &[u8; 32] = handshake[0..32].try_into().unwrap();
         let Some(sender_pubkey) =
@@ -103,7 +134,7 @@ impl Handshake {
             return Err(AdnlError::InvalidPubkey);
         };
 
-        let Some(keypair) = resolve_receiver(receiver) else {
+        let Some(keypair) = resolver.resolve_receiver(receiver) else {
             return Err(AdnlError::UnknownPubkey);
         };
 
@@ -119,9 +150,12 @@ impl Handshake {
             return Err(AdnlError::InvalidChecksum);
         }
 
+        let aes_params = AesParams::wrap(&*aes_params);
+
         Ok(Self {
             peer_id: HashBytes(sender_pubkey.to_bytes()),
-            codec: TcpAdnlCodec::server(AesParams::wrap(&*aes_params)),
+            decoder: TcpAdnlDecoder::server(aes_params),
+            encoder: TcpAdnlEncoder::server(aes_params),
         })
     }
 }
@@ -154,7 +188,7 @@ mod test {
             .parse()
             .map(|HashBytes(bytes)| ed25519::SecretKey::from_bytes(bytes))
             .unwrap();
-        let keypair = Arc::new(ed25519::KeyPair::from(&secret));
+        let keypair = ed25519::KeyPair::from(&secret);
 
         let listener = TcpListener::bind("0.0.0.0:12000").await?;
         loop {
@@ -165,8 +199,8 @@ mod test {
                 println!("accepted connection from {addr}");
 
                 let task = async {
-                    let mut connection =
-                        AdnlConnection::accept(socket, |_| Some(keypair.clone())).await?;
+                    let (rx, tx) = socket.into_split();
+                    let mut connection = AdnlConnection::accept(rx, tx, &keypair).await?;
                     println!(
                         "handshake complete for {addr}, peer_id={}",
                         connection.peer_id()
