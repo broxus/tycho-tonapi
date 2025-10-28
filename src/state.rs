@@ -25,8 +25,8 @@ use tycho_core::storage::{BlocksGcConfig, BlocksGcType, CoreStorage};
 use tycho_storage::kv::NamedTables;
 use tycho_types::merkle::MerkleProofBuilder;
 use tycho_types::models::{
-    Block, BlockId, BlockIdShort, DepthBalanceInfo, LibDescr, ShardAccount, ShardIdent,
-    ShardStateUnsplit, StdAddr,
+    Block, BlockId, BlockIdShort, DepthBalanceInfo, LibDescr, McBlockExtra, ShardAccount,
+    ShardIdent, ShardStateUnsplit, StdAddr,
 };
 use tycho_types::prelude::*;
 use tycho_util::mem::Reclaimer;
@@ -479,10 +479,49 @@ impl AppState {
     ) -> StateResult<Option<AccessedShardAccount>> {
         let this = self.inner.as_ref();
 
+        let resolve = |cached: Arc<CachedState>| {
+            let cached_block_id = cached.state.block_id();
+            let address_workchain = address.workchain;
+
+            if cached_block_id.shard.workchain() == address_workchain as i32 {
+                if cached_block_id.shard.contains_address(address) {
+                    Ok(Some(cached))
+                } else {
+                    Err(StateError::Internal(anyhow!(
+                        "requested account id is not contained in the shard of the reference block"
+                    )))
+                }
+            } else if cached_block_id.is_masterchain() {
+                if let Some(shards) = cached
+                    .state
+                    .shards()
+                    .map_err(StateError::Internal)?
+                    .get_workchain_shards(address_workchain as i32)?
+                {
+                    for entry in shards.latest_blocks() {
+                        let block_id = entry?;
+                        if !block_id.shard.contains_account(&address.address) {
+                            continue;
+                        }
+
+                        return Ok(this.recent_states.read().get(&block_id.as_short_id()));
+                    }
+                }
+
+                Err(StateError::Internal(anyhow!(
+                    "requested account id is not contained in any shard of the reference mc block"
+                )))
+            } else {
+                Err(StateError::Internal(anyhow!(
+                    "reference block must belong to the masterchain"
+                )))
+            }
+        };
+
         // Find a cached state at the specified block.
         // TODO: Load state from disk if not cached?
-        let cached = 'state: {
-            let mc_state_info;
+        let mc_state_info;
+        let Some(cached) = ({
             match at_block {
                 AtBlock::Latest => {
                     // NOTE: Keep the scope of `latest` as small as possible.
@@ -491,22 +530,15 @@ impl AppState {
                         return Err(StateError::NotReady);
                     };
 
-                    if address.is_masterchain() {
-                        break 'state latest.mc_state.clone();
-                    } else {
-                        for (shard, state) in &latest.shard_states {
-                            if shard.contains_address(address) {
-                                break 'state state.clone();
-                            }
-                        }
-                    }
-
                     mc_state_info = latest.mc_state.mc_state_info;
+                    latest.find_state_for_address(address)
                 }
                 AtBlock::BySeqno(short_id) => {
                     mc_state_info = this.load_mc_state_info()?;
                     if let Some(cached) = this.recent_states.read().get(short_id) {
-                        break 'state cached;
+                        resolve(cached)?
+                    } else {
+                        None
                     }
                 }
                 AtBlock::ById(block_id) => {
@@ -514,11 +546,13 @@ impl AppState {
                     if let Some(cached) = this.recent_states.read().get(&block_id.as_short_id())
                         && cached.state.block_id() == block_id
                     {
-                        break 'state cached;
+                        resolve(cached)?
+                    } else {
+                        None
                     }
                 }
             }
-
+        }) else {
             return Ok(WithMcStateInfo::new(mc_state_info, None));
         };
 
@@ -686,13 +720,6 @@ impl BlockSubscriber for AppState {
     type HandleBlockFut<'a> = BoxFuture<'a, Result<()>>;
 
     fn prepare_block<'a>(&'a self, cx: &'a BlockSubscriberContext) -> Self::PrepareBlockFut<'a> {
-        struct LatestBlockInfo {
-            id: BlockId,
-            end_lt: u64,
-            gen_utime: u32,
-            reg_mc_seqno: u32,
-        }
-
         let block_id = *cx.block.id();
         let mc_seqno = cx.mc_block_id.seqno;
 
@@ -717,26 +744,7 @@ impl BlockSubscriber for AppState {
                 .is_masterchain()
                 .then(|| {
                     let custom = block.load_custom()?;
-                    let mut shards = Vec::new();
-                    for entry in custom.shards.iter() {
-                        let (shard, descr) = entry?;
-                        if i8::try_from(shard.workchain()).is_err() {
-                            continue;
-                        }
-
-                        shards.push(LatestBlockInfo {
-                            id: BlockId {
-                                shard,
-                                seqno: descr.seqno,
-                                root_hash: descr.root_hash,
-                                file_hash: descr.file_hash,
-                            },
-                            end_lt: descr.end_lt,
-                            gen_utime: descr.gen_utime,
-                            reg_mc_seqno: descr.reg_mc_seqno,
-                        })
-                    }
-                    Ok::<_, anyhow::Error>(shards)
+                    BriefShardDescription::load_from_custom(custom)
                 })
                 .transpose()?;
 
@@ -778,11 +786,11 @@ impl BlockSubscriber for AppState {
             if let Some(shard_hashes) = &shard_hashes {
                 value.extend_from_slice(&(shard_hashes.len() as u32).to_le_bytes());
                 for item in shard_hashes {
-                    value.push(item.id.shard.workchain() as i8 as u8);
-                    value.extend_from_slice(&item.id.shard.prefix().to_le_bytes());
-                    value.extend_from_slice(&item.id.seqno.to_le_bytes());
-                    value.extend_from_slice(item.id.root_hash.as_array());
-                    value.extend_from_slice(item.id.file_hash.as_array());
+                    value.push(item.block_id.shard.workchain() as i8 as u8);
+                    value.extend_from_slice(&item.block_id.shard.prefix().to_le_bytes());
+                    value.extend_from_slice(&item.block_id.seqno.to_le_bytes());
+                    value.extend_from_slice(item.block_id.root_hash.as_array());
+                    value.extend_from_slice(item.block_id.file_hash.as_array());
                     value.extend_from_slice(&item.end_lt.to_le_bytes());
                     value.extend_from_slice(&item.gen_utime.to_le_bytes());
                     value.extend_from_slice(&item.reg_mc_seqno.to_le_bytes());
@@ -852,24 +860,11 @@ impl StateSubscriber for AppState {
             this.db_snapshot
                 .store(Some(Arc::new(this.db.owned_snapshot())));
 
-            let mut shard_description = Vec::new();
-            {
-                let custom = cx.block.load_custom()?;
-                for entry in custom.shards.iter() {
-                    let (shard, descr) = entry?;
-                    shard_description.push(BriefShardDescription {
-                        block_id: BlockId {
-                            shard,
-                            seqno: descr.seqno,
-                            root_hash: descr.root_hash,
-                            file_hash: descr.file_hash,
-                        },
-                        end_lt: descr.end_lt,
-                        gen_utime: descr.gen_utime,
-                        reg_mc_seqno: descr.reg_mc_seqno,
-                    });
-                }
-            };
+            // TODO: Somehow reuse data from `prepare_block`
+            let shard_description = cx
+                .block
+                .load_custom()
+                .and_then(BriefShardDescription::load_from_custom)?;
 
             // Prepare cached mc state
             let mc_state = CachedState::for_masterchain(state).map(Arc::new)?;
@@ -896,6 +891,10 @@ impl StateSubscriber for AppState {
                     CachedState::for_shard(state, mc_state.mc_state_info).map(Arc::new)
                 })
                 .collect::<Result<Vec<_>>>()?;
+
+            this.recent_states
+                .write()
+                .push(mc_state.clone(), new_shard_states.clone());
 
             // Update the latest states
             this.latest_states.store(Some(Arc::new(LatestStates {
@@ -1217,6 +1216,21 @@ struct LatestStates {
     shard_states: FastHashMap<ShardIdent, Arc<CachedState>>,
 }
 
+impl LatestStates {
+    fn find_state_for_address(&self, address: &StdAddr) -> Option<Arc<CachedState>> {
+        if address.is_masterchain() {
+            Some(self.mc_state.clone())
+        } else {
+            for (shard, state) in &self.shard_states {
+                if shard.contains_address(address) {
+                    return Some(state.clone());
+                }
+            }
+            None
+        }
+    }
+}
+
 struct RecentStates {
     states_tail_len: NonZeroUsize,
     mc_seqno_start: u32,
@@ -1371,6 +1385,31 @@ pub struct BriefShardDescription {
     pub end_lt: u64,
     pub gen_utime: u32,
     pub reg_mc_seqno: u32,
+}
+
+impl BriefShardDescription {
+    fn load_from_custom(custom: &McBlockExtra) -> Result<Vec<Self>, tycho_types::error::Error> {
+        let mut result = Vec::new();
+        for entry in custom.shards.iter() {
+            let (shard, descr) = entry?;
+            if i8::try_from(shard.workchain()).is_err() {
+                continue;
+            }
+
+            result.push(BriefShardDescription {
+                block_id: BlockId {
+                    shard,
+                    seqno: descr.seqno,
+                    root_hash: descr.root_hash,
+                    file_hash: descr.file_hash,
+                },
+                end_lt: descr.end_lt,
+                gen_utime: descr.gen_utime,
+                reg_mc_seqno: descr.reg_mc_seqno,
+            })
+        }
+        Ok(result)
+    }
 }
 
 #[derive(Debug)]
