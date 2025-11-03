@@ -580,7 +580,7 @@ impl AppState {
                     let (accounts, _) = state.accounts.load()?.into_parts();
 
                     let account = accounts
-                        .get(&address.address)?
+                        .get(address.address)?
                         .map(|(_, account)| account.account.into_inner());
 
                     account_proof = {
@@ -647,7 +647,7 @@ impl AppState {
 
             let account = cached
                 .accounts
-                .get(&address.address)?
+                .get(address.address)?
                 .map(|(_, account)| account.account.into_inner())
                 .map(Boc::encode);
 
@@ -1194,7 +1194,7 @@ impl Inner {
             iter.next();
         }
 
-        return Ok(OldEvent::NotFound(snapshot));
+        Ok(OldEvent::NotFound(snapshot))
     }
 }
 

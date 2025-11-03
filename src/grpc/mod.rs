@@ -371,9 +371,9 @@ impl<T> RequireField for Option<T> {
     fn require(&self) -> tonic::Result<&Self::Field> {
         match self {
             Some(field) => Ok(field),
-            None => Err(tonic::Status::invalid_argument(format!(
-                "required field is missing"
-            ))),
+            None => Err(tonic::Status::invalid_argument(
+                "required field is missing".to_owned(),
+            )),
         }
     }
 }
@@ -381,9 +381,7 @@ impl<T> RequireField for Option<T> {
 fn parse_hash_ref(value: &[u8]) -> tonic::Result<&HashBytes> {
     match value.try_into() {
         Ok::<&[u8; 32], _>(value) => Ok(HashBytes::wrap(value)),
-        Err(_) => Err(tonic::Status::invalid_argument(format!(
-            "invalid hash length"
-        ))),
+        Err(_) => Err(tonic::Status::invalid_argument("invalid hash length").to_owned()),
     }
 }
 
