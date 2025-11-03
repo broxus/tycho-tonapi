@@ -87,6 +87,7 @@ impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
             zerostate_root_hash: status.zerostate_id.root_hash.as_slice().to_vec(),
             zerostate_file_hash: status.zerostate_id.file_hash.as_slice().to_vec(),
             init_block_seqno: status.init_block_seqno,
+            version: crate::version_packed(),
         }))
     }
 

@@ -32,6 +32,8 @@ message GetStatusResponse {
     bytes zerostateFileHash = 4;
     // From which masterchain block the node started working.
     uint32 initBlockSeqno = 5;
+    // Node version (encoded as octets, e.g. version 1.2.3 will be 0x00010203)
+    uint32 version = 6;
 }
 
 // === Watch block ids ===
