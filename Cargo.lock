@@ -3161,14 +3161,12 @@ dependencies = [
 
 [[package]]
 name = "tycho-tonapi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
- "ahash",
  "anyhow",
  "arc-swap",
  "bytes",
  "bytesize 2.1.0",
- "castaway",
  "clap",
  "futures-util",
  "humantime",
@@ -3177,7 +3175,6 @@ dependencies = [
  "prost",
  "scopeguard",
  "serde",
- "serde_json",
  "thiserror 2.0.17",
  "tikv-jemallocator",
  "tokio",
