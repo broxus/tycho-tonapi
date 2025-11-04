@@ -36,6 +36,15 @@ By default the node will listen on the following addresses:
 - `127.0.0.1:10000/TCP` for prometheus exporter (`.metrics.listen_addr` field in the config);
 - `127.0.0.1:50051/TCP` for the gRPC server (`.grpc.listen_addr` field in the config).
 
+## How to generate Grafana dashboard
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r ./scripts/requirements.txt
+python ./scripts/gen-dashboard.py > dashboard.json
+```
+
 ## Contributing
 
 We welcome contributions to the project! If you notice any issues or errors,
