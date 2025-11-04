@@ -6,6 +6,12 @@ A simple lite-server that can be used for block streaming and serving account st
 
 ## How To Run
 
+Install dependencies:
+```bash
+sudo apt install build-essential git libssl-dev zlib1g-dev pkg-config clang
+```
+
+Build and run the node:
 ```bash
 # Install.
 git clone https://github.com/broxus/tycho-tonapi.git
