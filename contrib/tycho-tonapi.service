@@ -1,0 +1,18 @@
+[Unit]
+Description=Tycho TONAPI
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=3
+WorkingDirectory=/var/node/data/
+ExecStart=/var/node/bin/tycho-tonapi run --keys keys.json \
+    --config config.json \
+    --global-config global-config.json \
+
+Environment=RUST_BACKTRACE=1,RUST_LIB_BACKTRACE=0
+
+[Install]
+WantedBy=multi-user.target
