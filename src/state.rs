@@ -18,8 +18,10 @@ use tokio::task::AbortHandle;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
+use tycho_block_util::message::validate_external_message;
 use tycho_block_util::state::ShardStateStuff;
 use tycho_core::block_strider::{BlockSubscriber, BlockSubscriberContext, StateSubscriber};
+use tycho_core::blockchain_rpc::BlockchainRpcClient;
 use tycho_core::global_config::ZerostateId;
 use tycho_core::storage::{BlocksGcConfig, BlocksGcType, CoreStorage};
 use tycho_storage::kv::NamedTables;
@@ -100,6 +102,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(
+        client: BlockchainRpcClient,
         storage: CoreStorage,
         zerostate_id: ZerostateId,
         config: AppStateConfig,
@@ -128,6 +131,7 @@ impl AppState {
         Ok(Self {
             inner: Arc::new(Inner {
                 is_ready: AtomicBool::new(false),
+                client,
                 storage,
                 libs_cache: moka::sync::Cache::builder()
                     .max_capacity(config.libs_cache_capacity)
@@ -686,6 +690,14 @@ impl AppState {
         Ok(WithMcStateInfo::new(state.mc_state_info, lib))
     }
 
+    pub async fn send_message(&self, message: Bytes) -> Result<usize, StateError> {
+        if let Err(e) = validate_external_message(&message).await {
+            return Err(StateError::InvalidData(e.into()));
+        }
+
+        Ok(self.inner.client.broadcast_external_message(&message).await)
+    }
+
     // ===
 
     fn find_block_id_by_seqno(&self, short_id: &BlockIdShort) -> Result<Option<BlockId>> {
@@ -925,6 +937,7 @@ impl StateSubscriber for AppState {
 
 struct Inner {
     is_ready: AtomicBool,
+    client: BlockchainRpcClient,
     storage: CoreStorage,
     libs_cache: moka::sync::Cache<HashBytes, Bytes, FastHasherState>,
     latest_states: ArcSwapOption<LatestStates>,
@@ -1508,6 +1521,8 @@ pub enum StateError {
     Internal(#[source] anyhow::Error),
     #[error("cancelled")]
     Cancelled,
+    #[error("invalid data: {0}")]
+    InvalidData(anyhow::Error),
 }
 
 impl From<tycho_types::error::Error> for StateError {

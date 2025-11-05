@@ -43,3 +43,9 @@ tonic-prost-build = "*"
 
 [package.metadata.cargo-shear]
 ignored = ["prost", "tonic-prost"]
+
+[patch.crates-io]
+tycho-block-util = { git = "https://github.com/broxus/tycho.git", rev = "e4ccaa1ce2ff15e1d484d1216ce1c11568563705" }
+tycho-core = { git = "https://github.com/broxus/tycho.git", rev = "e4ccaa1ce2ff15e1d484d1216ce1c11568563705" }
+tycho-storage = { git = "https://github.com/broxus/tycho.git", rev = "e4ccaa1ce2ff15e1d484d1216ce1c11568563705" }
+tycho-util = { git = "https://github.com/broxus/tycho.git", rev = "e4ccaa1ce2ff15e1d484d1216ce1c11568563705" }

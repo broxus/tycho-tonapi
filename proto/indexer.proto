@@ -14,6 +14,8 @@ service TychoIndexer {
     rpc GetShardAccount (GetShardAccountRequest) returns (GetShardAccountResponse);
     // Search for a library code.
     rpc GetLibraryCell (GetLibraryCellRequest) returns (GetLibraryCellResponse);
+    // Send message to validators.
+    rpc SendMessage (SendMessageRequest) returns (SendMessageResponse);
 }
 
 // === Get status ===
@@ -190,6 +192,18 @@ message LibraryCellFound {
     McStateInfo mcStateInfo = 1;
     // BOC-encoded library code.
     bytes cell = 2;
+}
+
+// === Send message ===
+
+message SendMessageRequest {
+    // BOC-encoded `Message`.
+    bytes message = 1;
+}
+
+message SendMessageResponse {
+    // Number of nodes this message was successfully delivered to.
+    uint32 deliveredTo = 1;
 }
 
 // === Common stuff ===

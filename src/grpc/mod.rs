@@ -197,6 +197,20 @@ impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
             }),
         }))
     }
+
+    async fn send_message(
+        &self,
+        request: tonic::Request<proto::SendMessageRequest>,
+    ) -> tonic::Result<tonic::Response<proto::SendMessageResponse>> {
+        let delivered_to = self
+            .state
+            .send_message(request.into_inner().message)
+            .await?;
+
+        Ok(tonic::Response::new(proto::SendMessageResponse {
+            delivered_to: delivered_to as u32,
+        }))
+    }
 }
 
 // === Streams ===
@@ -406,6 +420,7 @@ impl From<StateError> for tonic::Status {
             StateError::NotReady => tonic::Status::unavailable("service is not ready"),
             StateError::Internal(error) => tonic::Status::internal(error.to_string()),
             StateError::Cancelled => tonic::Status::cancelled("operation cancelled"),
+            StateError::InvalidData(error) => tonic::Status::invalid_argument(error.to_string()),
         }
     }
 }

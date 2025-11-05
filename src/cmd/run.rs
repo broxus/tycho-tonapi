@@ -124,6 +124,7 @@ impl Cmd {
             .build()?;
 
         let state = AppState::new(
+            node.blockchain_rpc_client.clone(),
             node.core_storage.clone(),
             global_config.zerostate,
             node_config.app,

@@ -10,6 +10,7 @@ fn main() -> Result<()> {
         .bytes(".indexer.BlockChunk.data")
         .bytes(".indexer.ShardAccount.accountState")
         .bytes(".indexer.ShardAccount.proof")
+        .bytes(".indexer.SendMessageRequest.message")
         .compile_protos(&["proto/indexer.proto"], &["proto"])?;
 
     let app_version = env("CARGO_PKG_VERSION")?;
