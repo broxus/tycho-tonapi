@@ -198,6 +198,39 @@ impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
         }))
     }
 
+    async fn get_library_cells(
+        &self,
+        request: tonic::Request<proto::GetLibraryCellsRequest>,
+    ) -> tonic::Result<tonic::Response<proto::GetLibraryCellsResponse>> {
+        let hashes = request.get_ref().hashes.as_slice();
+        let max_batch_len = self.state.config().libs_max_batch_len;
+        if hashes.len() > max_batch_len {
+            return Err(tonic::Status::invalid_argument(format!(
+                "too many libraries requested, at most {max_batch_len} is allowed"
+            )));
+        }
+
+        let mut hashes = hashes
+            .iter()
+            .map(|item| parse_hash_ref(item))
+            .collect::<Result<Vec<_>, _>>()?;
+        hashes.sort_unstable();
+        hashes.dedup();
+
+        let res = self.state.get_library_cells(hashes.iter().copied())?;
+        Ok(tonic::Response::new(proto::GetLibraryCellsResponse {
+            mc_state_info: Some(res.mc_state_info.into()),
+            entries: res
+                .data
+                .into_iter()
+                .map(|item| proto::LibraryCellsBatchEntry {
+                    hash: item.hash.as_array().to_vec(),
+                    cell: item.cell,
+                })
+                .collect(),
+        }))
+    }
+
     async fn send_message(
         &self,
         request: tonic::Request<proto::SendMessageRequest>,

@@ -7,6 +7,7 @@ fn main() -> Result<()> {
         .build_client(false)
         .build_server(true)
         .bytes(".indexer.LibraryCellFound.cell")
+        .bytes(".indexer.LibraryCellsBatchEntry.cell")
         .bytes(".indexer.BlockChunk.data")
         .bytes(".indexer.ShardAccount.accountState")
         .bytes(".indexer.ShardAccount.proof")

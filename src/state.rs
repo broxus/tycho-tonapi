@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -48,6 +49,11 @@ pub struct AppStateConfig {
     /// Default: `100`
     pub libs_cache_capacity: u64,
 
+    /// Maximum number of items allowed to request in batch.
+    ///
+    /// Default: `16`
+    pub libs_max_batch_len: usize,
+
     /// Block data is divided into chunks of this size.
     ///
     /// Default: `1 MB`
@@ -84,6 +90,7 @@ impl Default for AppStateConfig {
     fn default() -> Self {
         Self {
             libs_cache_capacity: 100,
+            libs_max_batch_len: 16,
             block_data_chunk_size: ByteSize::mib(1),
             max_concurrent_downloads: 1000,
             max_subscriptions: 10000,
@@ -155,6 +162,7 @@ impl AppState {
                 gc_seqno_offset,
                 gc_interval: config.gc_interval,
                 gc_task_handle: Default::default(),
+                config,
             }),
         })
     }
@@ -259,6 +267,10 @@ impl AppState {
 
         tracing::info!("app state is ready");
         Ok(())
+    }
+
+    pub fn config(&self) -> &AppStateConfig {
+        &self.inner.config
     }
 
     pub fn get_status(&self) -> AppStatus {
@@ -690,6 +702,43 @@ impl AppState {
         Ok(WithMcStateInfo::new(state.mc_state_info, lib))
     }
 
+    // TODO: Make this method async and serialize libraries in a rayon task.
+    pub fn get_library_cells<I, T>(&self, hashes: I) -> StateResult<Vec<LibrariesBatchEntry>>
+    where
+        I: ExactSizeIterator<Item = T>,
+        T: Borrow<HashBytes>,
+    {
+        let state = 'state: {
+            if let Some(latest) = self.inner.latest_states.load().as_ref() {
+                break 'state latest.mc_state.clone();
+            }
+            return Err(StateError::NotReady);
+        };
+
+        let mut result = Vec::with_capacity(hashes.len());
+
+        for item in hashes {
+            let hash = item.borrow();
+            let mut lib = self.inner.libs_cache.get(hash);
+            if lib.is_none() {
+                lib = state
+                    .libraries
+                    .get(hash)?
+                    .map(|x| Bytes::from(Boc::encode(x.lib)));
+
+                if let Some(lib) = &lib {
+                    self.inner.libs_cache.insert(*hash, lib.clone());
+                }
+            }
+
+            if let Some(cell) = lib {
+                result.push(LibrariesBatchEntry { hash: *hash, cell });
+            }
+        }
+
+        Ok(WithMcStateInfo::new(state.mc_state_info, result))
+    }
+
     pub async fn send_message(&self, message: Bytes) -> Result<usize, StateError> {
         if let Err(e) = validate_external_message(&message).await {
             return Err(StateError::InvalidData(e.into()));
@@ -937,6 +986,7 @@ impl StateSubscriber for AppState {
 
 struct Inner {
     is_ready: AtomicBool,
+    config: AppStateConfig,
     client: BlockchainRpcClient,
     storage: CoreStorage,
     libs_cache: moka::sync::Cache<HashBytes, Bytes, FastHasherState>,
@@ -1382,6 +1432,12 @@ pub struct McStateInfo {
     pub mc_seqno: u32,
     pub lt: u64,
     pub utime: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct LibrariesBatchEntry {
+    pub hash: HashBytes,
+    pub cell: Bytes,
 }
 
 #[derive(Debug)]

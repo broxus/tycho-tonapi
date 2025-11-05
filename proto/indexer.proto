@@ -14,6 +14,8 @@ service TychoIndexer {
     rpc GetShardAccount (GetShardAccountRequest) returns (GetShardAccountResponse);
     // Search for a library code.
     rpc GetLibraryCell (GetLibraryCellRequest) returns (GetLibraryCellResponse);
+    // Search for multiple libraries.
+    rpc GetLibraryCells (GetLibraryCellsRequest) returns (GetLibraryCellsResponse);
     // Send message to validators.
     rpc SendMessage (SendMessageRequest) returns (SendMessageResponse);
 }
@@ -190,6 +192,28 @@ message LibraryCellNotFound {
 message LibraryCellFound {
     // Brief masterchain info at the moment of accessing the state.
     McStateInfo mcStateInfo = 1;
+    // BOC-encoded library code.
+    bytes cell = 2;
+}
+
+// === Get library cells ===
+
+message GetLibraryCellsRequest {
+    // An array of library root hashes (as 32 bytes).
+    // NOTE: All non-unique entries are deduplicated.
+    repeated bytes hashes = 1;
+}
+
+message GetLibraryCellsResponse {
+    // Brief masterchain info at the moment of accessing the state.
+    McStateInfo mcStateInfo = 1;
+    // List of found libraries. Non-existing libraries are not included into this list.
+    repeated LibraryCellsBatchEntry entries = 2;
+}
+
+message LibraryCellsBatchEntry {
+    // 32 bytes of the library cell root hash.
+    bytes hash = 1;
     // BOC-encoded library code.
     bytes cell = 2;
 }
