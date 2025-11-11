@@ -28,7 +28,8 @@ wget -O global-config.json https://testnet.tychoprotocol.com/global-config.json
 tycho-tonapi run \
   --config config.json \
   --global-config global-config.json \
-  --keys keys.json
+  --keys keys.json \
+  --cold-boot latest-persistent # or `genesis` to sync from the zerostate
 ```
 
 By default the node will listen on the following addresses:
