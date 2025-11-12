@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
@@ -18,13 +18,16 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::AbortHandle;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::ReusableBoxFuture;
 use tracing::Instrument;
 use tycho_block_util::message::validate_external_message;
 use tycho_block_util::state::ShardStateStuff;
 use tycho_core::block_strider::{BlockSubscriber, BlockSubscriberContext, StateSubscriber};
 use tycho_core::blockchain_rpc::BlockchainRpcClient;
 use tycho_core::global_config::ZerostateId;
-use tycho_core::storage::{BlocksGcConfig, BlocksGcType, CoreStorage};
+use tycho_core::storage::{
+    BlocksGcConfig, BlocksGcType, CoreStorage, PersistentStateKind, PersistentStateStorage,
+};
 use tycho_storage::kv::NamedTables;
 use tycho_types::merkle::MerkleProofBuilder;
 use tycho_types::models::{
@@ -152,7 +155,7 @@ impl AppState {
                 }),
                 new_states: Default::default(),
                 block_data_chunk_size: config.block_data_chunk_size.as_u64(),
-                download_block_semaphore: Arc::new(Semaphore::new(config.max_concurrent_downloads)),
+                download_semaphore: Arc::new(Semaphore::new(config.max_concurrent_downloads)),
                 subscriptions_semaphore: Arc::new(Semaphore::new(config.max_subscriptions)),
                 db,
                 db_snapshot: Default::default(),
@@ -456,12 +459,7 @@ impl AppState {
                 _ => break 'stream None,
             };
 
-            let permit = this
-                .download_block_semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| StateError::Internal(anyhow!("blocks semaphore dropped")))?;
+            let permit = self.acquire_downloads_semaphore().await?;
 
             // Check once more if block was removed during waiting for a permit.
             if !handle.has_data() {
@@ -482,6 +480,54 @@ impl AppState {
                 offset: 0,
                 _permit: permit,
             }))
+        };
+
+        Ok(WithMcStateInfo::new(mc_state_info, stream))
+    }
+
+    pub async fn get_persistent_state(
+        &self,
+        kind: PersistentStateKind,
+        query: &QueryBlock,
+    ) -> StateResult<Option<Box<PersistentStateStream>>> {
+        let this = self.inner.as_ref();
+        let mc_state_info = this.load_mc_state_info()?;
+
+        let states = this.storage.persistent_state_storage();
+
+        let stream = 'stream: {
+            let block_id = match query {
+                QueryBlock::BySeqno(short_id)
+                    if short_id.is_masterchain() && short_id.seqno == 0 =>
+                {
+                    this.zerostate_id.as_block_id()
+                }
+                QueryBlock::BySeqno(short_id) => {
+                    let Some(block_id) = self
+                        .find_block_id_by_seqno(short_id)
+                        .map_err(StateError::Internal)?
+                    else {
+                        break 'stream None;
+                    };
+                    block_id
+                }
+                QueryBlock::ById(block_id) => *block_id,
+            };
+
+            let permit = self.acquire_downloads_semaphore().await?;
+
+            let Some(info) = states.get_state_info(&block_id, kind) else {
+                break 'stream None;
+            };
+
+            Some(Box::new(PersistentStateStream::new(
+                &block_id,
+                kind,
+                info.size.get(),
+                info.chunk_size.get() as u64,
+                states.clone(),
+                permit,
+            )))
         };
 
         Ok(WithMcStateInfo::new(mc_state_info, stream))
@@ -773,6 +819,15 @@ impl AppState {
             file_hash: HashBytes::from_slice(&value[32..64]),
         }))
     }
+
+    async fn acquire_downloads_semaphore(&self) -> Result<OwnedSemaphorePermit, StateError> {
+        self.inner
+            .download_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| StateError::Internal(anyhow!("downloads semaphore dropped")))
+    }
 }
 
 impl BlockSubscriber for AppState {
@@ -994,7 +1049,7 @@ struct Inner {
     recent_states: RwLock<RecentStates>,
     new_states: Mutex<NewStates>,
     block_data_chunk_size: u64,
-    download_block_semaphore: Arc<Semaphore>,
+    download_semaphore: Arc<Semaphore>,
     subscriptions_semaphore: Arc<Semaphore>,
     db: TonApiDb,
     db_snapshot: ArcSwapOption<OwnedSnapshot>,
@@ -1549,6 +1604,93 @@ impl Stream for BlockDataStream {
         let data = this.data.slice(this.offset as usize..next_offset as usize);
         this.offset = next_offset;
         Poll::Ready(Some(Ok(data)))
+    }
+}
+
+// TODO: Decompress?
+pub struct PersistentStateStream {
+    block_id: BlockId,
+    ty: PersistentStateKind,
+    total_size: u64,
+    chunk_size: u64,
+    offset: u64,
+    fut: ReusableBoxFuture<'static, ReadStatePartFutOutput>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl PersistentStateStream {
+    fn new(
+        block_id: &BlockId,
+        state_kind: PersistentStateKind,
+        total_size: u64,
+        chunk_size: u64,
+        storage: PersistentStateStorage,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        let fut = ReusableBoxFuture::new(Self::read_state_part(storage, block_id, 0, state_kind));
+        Self {
+            block_id: *block_id,
+            ty: state_kind,
+            total_size,
+            chunk_size,
+            offset: 0,
+            fut,
+            _permit: permit,
+        }
+    }
+
+    #[inline]
+    pub fn total_size(&self) -> u64 {
+        self.total_size
+    }
+
+    #[inline]
+    pub fn chunk_size(&self) -> u64 {
+        self.chunk_size
+    }
+
+    fn read_state_part(
+        storage: PersistentStateStorage,
+        block_id: &BlockId,
+        offset: u64,
+        state_kind: PersistentStateKind,
+    ) -> impl Future<Output = ReadStatePartFutOutput> + 'static {
+        let block_id = *block_id;
+        async move {
+            let res = storage.read_state_part(&block_id, offset, state_kind).await;
+            (storage, res)
+        }
+    }
+}
+
+type ReadStatePartFutOutput = (PersistentStateStorage, Option<Vec<u8>>);
+
+impl Stream for PersistentStateStream {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.offset >= self.total_size {
+            return Poll::Ready(None);
+        }
+
+        let (storage, res) = ready!(self.fut.poll(cx));
+        let Some(chunk) = res else {
+            self.offset = u64::MAX;
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "chunk not found",
+            ))));
+        };
+
+        self.offset += chunk.len() as u64;
+        debug_assert!(chunk.len() as u64 <= self.chunk_size);
+
+        if self.offset < self.total_size {
+            let fut = Self::read_state_part(storage, &self.block_id, self.offset, self.ty);
+            self.fut.set(fut);
+        }
+
+        Poll::Ready(Some(Ok(Bytes::from(chunk))))
     }
 }
 

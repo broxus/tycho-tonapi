@@ -1,11 +1,14 @@
+use std::marker::PhantomData;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
+use bytes::Bytes;
 use bytesize::ByteSize;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio_stream::Stream;
+use tycho_core::storage::PersistentStateKind;
 use tycho_types::cell::HashBytes;
 use tycho_types::models::{BlockIdShort, ShardIdent, StdAddr};
 
@@ -74,7 +77,8 @@ impl GrpcServer {
 #[tonic::async_trait]
 impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
     type WatchBlockIdsStream = WatchBlockIdsStream;
-    type GetBlockStream = GetBlockStream;
+    type GetBlockStream = DataStream<BlockDataStreamProto>;
+    type GetPersistentStateStream = DataStream<PersistentStateStreamProto>;
 
     async fn get_status(
         &self,
@@ -122,18 +126,44 @@ impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
         };
         let res = self.state.get_block(&query).await?;
 
-        Ok(tonic::Response::new(match res.data {
-            Some(stream) => GetBlockStream::Found {
-                mc_state_info: res.mc_state_info,
-                offset: 0,
-                first: true,
-                stream: Some(stream),
-            },
-            None => GetBlockStream::NotFound {
-                mc_state_info: res.mc_state_info,
-                finished: false,
-            },
-        }))
+        Ok(tonic::Response::new(Self::GetBlockStream::new(
+            res.mc_state_info,
+            res.data,
+        )))
+    }
+
+    async fn get_persistent_state(
+        &self,
+        request: tonic::Request<proto::GetPersistentStateRequest>,
+    ) -> tonic::Result<tonic::Response<Self::GetPersistentStateStream>> {
+        use self::proto::get_persistent_state_request::Query as ProtoQueryState;
+        use crate::state::QueryBlock;
+
+        const TYPE_SHARD: i32 = proto::PersistentStateType::Shard as i32;
+        const TYPE_QUEUE: i32 = proto::PersistentStateType::Queue as i32;
+        let state_type = match request.get_ref().r#type {
+            TYPE_SHARD => PersistentStateKind::Shard,
+            TYPE_QUEUE => PersistentStateKind::Queue,
+            _ => {
+                return Err(tonic::Status::invalid_argument(
+                    "unknown persistent state type",
+                ));
+            }
+        };
+
+        let query = match request.get_ref().query.require()? {
+            ProtoQueryState::BySeqno(q) => QueryBlock::BySeqno(BlockIdShort {
+                shard: parse_shard_id(q.workchain, q.shard)?,
+                seqno: q.seqno,
+            }),
+            ProtoQueryState::ById(q) => QueryBlock::ById(q.id.require()?.try_into()?),
+        };
+        let res = self.state.get_persistent_state(state_type, &query).await?;
+
+        Ok(tonic::Response::new(Self::GetPersistentStateStream::new(
+            res.mc_state_info,
+            res.data,
+        )))
     }
 
     async fn get_shard_account(
@@ -307,46 +337,198 @@ impl tokio_stream::Stream for WatchBlockIdsStream {
     }
 }
 
-pub enum GetBlockStream {
+pub trait DataStreamProto: Unpin {
+    type Response;
+    type Msg;
+    type Chunk;
+    type Stream: Stream<Item = std::io::Result<Bytes>> + Unpin;
+
+    fn stream_total_size(stream: &Self::Stream) -> u64;
+    fn stream_chunk_size(stream: &Self::Stream) -> u64;
+
+    fn chunk(offset: u64, data: Bytes) -> Self::Chunk;
+
+    fn msg_not_found(mc_state_info: crate::state::McStateInfo) -> Self::Msg;
+    fn msg_found(
+        mc_state_info: crate::state::McStateInfo,
+        total_size: u64,
+        max_chunk_size: u64,
+        first_chunk: Self::Chunk,
+    ) -> Self::Msg;
+    fn msg_chunk(chunk: Self::Chunk) -> Self::Msg;
+
+    fn response(msg: Self::Msg) -> Self::Response;
+}
+
+pub struct BlockDataStreamProto;
+
+impl DataStreamProto for BlockDataStreamProto {
+    type Response = proto::GetBlockResponse;
+    type Msg = proto::get_block_response::Msg;
+    type Chunk = proto::BlockChunk;
+    type Stream = crate::state::BlockDataStream;
+
+    #[inline]
+    fn stream_total_size(stream: &Self::Stream) -> u64 {
+        stream.total_size()
+    }
+
+    #[inline]
+    fn stream_chunk_size(stream: &Self::Stream) -> u64 {
+        stream.chunk_size()
+    }
+
+    #[inline]
+    fn chunk(offset: u64, data: Bytes) -> Self::Chunk {
+        Self::Chunk { offset, data }
+    }
+
+    #[inline]
+    fn msg_not_found(mc_state_info: crate::state::McStateInfo) -> Self::Msg {
+        Self::Msg::NotFound(proto::BlockNotFound {
+            mc_state_info: Some(mc_state_info.into()),
+        })
+    }
+
+    #[inline]
+    fn msg_found(
+        mc_state_info: crate::state::McStateInfo,
+        total_size: u64,
+        max_chunk_size: u64,
+        first_chunk: Self::Chunk,
+    ) -> Self::Msg {
+        Self::Msg::Found(proto::BlockFound {
+            mc_state_info: Some(mc_state_info.into()),
+            total_size,
+            max_chunk_size,
+            first_chunk: Some(first_chunk),
+        })
+    }
+
+    #[inline]
+    fn msg_chunk(chunk: Self::Chunk) -> Self::Msg {
+        Self::Msg::Chunk(chunk)
+    }
+
+    #[inline]
+    fn response(msg: Self::Msg) -> Self::Response {
+        Self::Response { msg: Some(msg) }
+    }
+}
+
+pub struct PersistentStateStreamProto;
+
+impl DataStreamProto for PersistentStateStreamProto {
+    type Response = proto::GetPersistentStateResponse;
+    type Msg = proto::get_persistent_state_response::Msg;
+    type Chunk = proto::PersistentStateChunk;
+    type Stream = crate::state::PersistentStateStream;
+
+    #[inline]
+    fn stream_total_size(stream: &Self::Stream) -> u64 {
+        stream.total_size()
+    }
+
+    #[inline]
+    fn stream_chunk_size(stream: &Self::Stream) -> u64 {
+        stream.chunk_size()
+    }
+
+    #[inline]
+    fn chunk(offset: u64, data: Bytes) -> Self::Chunk {
+        Self::Chunk { offset, data }
+    }
+
+    #[inline]
+    fn msg_not_found(mc_state_info: crate::state::McStateInfo) -> Self::Msg {
+        Self::Msg::NotFound(proto::PersistentStateNotFound {
+            mc_state_info: Some(mc_state_info.into()),
+        })
+    }
+
+    #[inline]
+    fn msg_found(
+        mc_state_info: crate::state::McStateInfo,
+        total_size: u64,
+        max_chunk_size: u64,
+        first_chunk: Self::Chunk,
+    ) -> Self::Msg {
+        Self::Msg::Found(proto::PersistentStateFound {
+            mc_state_info: Some(mc_state_info.into()),
+            total_size,
+            max_chunk_size,
+            first_chunk: Some(first_chunk),
+        })
+    }
+
+    #[inline]
+    fn msg_chunk(chunk: Self::Chunk) -> Self::Msg {
+        Self::Msg::Chunk(chunk)
+    }
+
+    #[inline]
+    fn response(msg: Self::Msg) -> Self::Response {
+        Self::Response { msg: Some(msg) }
+    }
+}
+
+pub enum DataStream<T: DataStreamProto> {
     NotFound {
+        proto: PhantomData<T>,
         mc_state_info: crate::state::McStateInfo,
         finished: bool,
     },
     Found {
+        proto: PhantomData<T>,
         mc_state_info: crate::state::McStateInfo,
         offset: u64,
         first: bool,
-        stream: Option<Box<crate::state::BlockDataStream>>,
+        stream: Option<Box<T::Stream>>,
     },
 }
 
-impl Stream for GetBlockStream {
-    type Item = tonic::Result<proto::GetBlockResponse>;
+impl<T: DataStreamProto> DataStream<T> {
+    fn new(mc_state_info: crate::state::McStateInfo, stream: Option<Box<T::Stream>>) -> Self {
+        match stream {
+            None => Self::NotFound {
+                proto: PhantomData,
+                mc_state_info,
+                finished: false,
+            },
+            Some(stream) => Self::Found {
+                proto: PhantomData,
+                mc_state_info,
+                offset: 0,
+                first: true,
+                stream: Some(stream),
+            },
+        }
+    }
+}
+
+impl<T: DataStreamProto> Stream for DataStream<T> {
+    type Item = tonic::Result<T::Response>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        use proto::get_block_response::Msg;
-
         match &mut *self {
             // Send "NotFound" once.
-            GetBlockStream::NotFound {
+            Self::NotFound {
                 mc_state_info,
                 finished,
+                ..
             } => Poll::Ready(if *finished {
                 None
             } else {
                 *finished = true;
-                Some(Ok(proto::GetBlockResponse {
-                    msg: Some(Msg::NotFound(proto::BlockNotFound {
-                        mc_state_info: Some((*mc_state_info).into()),
-                    })),
-                }))
+                Some(Ok(T::response(T::msg_not_found(*mc_state_info))))
             }),
             // Send "Found" once and all remaining "Chunk"'s afterwards.
-            GetBlockStream::Found {
+            Self::Found {
                 mc_state_info,
                 offset,
                 first,
                 stream,
+                ..
             } => {
                 let field = stream;
                 let Some(stream) = field.as_mut() else {
@@ -356,30 +538,22 @@ impl Stream for GetBlockStream {
                 match Pin::new(stream.as_mut()).poll_next(cx) {
                     Poll::Ready(Some(Ok(data))) => {
                         let next_offset = offset.saturating_add(data.len() as u64);
-                        let chunk = proto::BlockChunk {
-                            offset: *offset,
-                            data,
-                        };
+                        let chunk = T::chunk(*offset, data);
                         *offset = next_offset;
 
-                        let total_size = stream.total_size();
-                        let max_chunk_size = stream.chunk_size();
+                        let total_size = T::stream_total_size(stream);
+                        let max_chunk_size = T::stream_chunk_size(stream);
                         if next_offset >= total_size {
                             *field = None;
                         }
 
                         let msg = if std::mem::take(first) {
-                            Msg::Found(proto::BlockFound {
-                                mc_state_info: Some((*mc_state_info).into()),
-                                total_size,
-                                max_chunk_size,
-                                first_chunk: Some(chunk),
-                            })
+                            T::msg_found(*mc_state_info, total_size, max_chunk_size, chunk)
                         } else {
-                            Msg::Chunk(chunk)
+                            T::msg_chunk(chunk)
                         };
 
-                        Poll::Ready(Some(Ok(proto::GetBlockResponse { msg: Some(msg) })))
+                        Poll::Ready(Some(Ok(T::response(msg))))
                     }
                     Poll::Ready(Some(Err(e))) => {
                         *field = None;

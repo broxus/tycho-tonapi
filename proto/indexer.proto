@@ -10,6 +10,11 @@ service TychoIndexer {
     // Returns a stream of BOC-encoded block data chunks if found,
     // otherwise returns a stream with a single block-not-found message.
     rpc GetBlock (GetBlockRequest) returns (stream GetBlockResponse);
+    // Returns a stream of a persistent state chunks if found,
+    // otherwise returns a stream with a single block-not-found message.
+    // Persistent state is either a BOC-encoded ShardStateUnsplit or queue state,
+    // depending on a requested type.
+    rpc GetPersistentState (GetPersistentStateRequest) returns (stream GetPersistentStateResponse);
     // Search for a shard account state.
     rpc GetShardAccount (GetShardAccountRequest) returns (GetShardAccountResponse);
     // Search for a library code.
@@ -123,6 +128,53 @@ message BlockFound {
 message BlockChunk {
     uint64 offset = 1;
     bytes data = 2;
+}
+
+// === Get persistent state ===
+
+message GetPersistentStateRequest {
+    // Which part of persistent state to query.
+    PersistentStateType type = 1;
+    oneof query {
+        // Searches for a state by seqno.
+        BlockBySeqno bySeqno = 2;
+        // Searches for a state by its id.
+        BlockById byId = 3;
+    }
+}
+
+message GetPersistentStateResponse {
+    oneof msg {
+        // First and last message in stream if not found.
+        PersistentStateNotFound notFound = 1;
+        // First message in stream if found.
+        PersistentStateFound found = 2;
+        // Subsequent messages in stream if it didn't fit into one chunk.
+        PersistentStateChunk chunk = 3;
+    }
+}
+
+message PersistentStateNotFound {
+    McStateInfo mcStateInfo = 1;
+}
+
+message PersistentStateFound {
+    McStateInfo mcStateInfo = 1;
+    uint64 totalSize = 2;
+    uint64 maxChunkSize = 3;
+    PersistentStateChunk firstChunk = 4;
+}
+
+message PersistentStateChunk {
+    uint64 offset = 1;
+    bytes data = 2;
+}
+
+enum PersistentStateType {
+    // BOC-encoded ShardStateUnsplit.
+    SHARD = 0;
+    // TL-encoded queue state.
+    QUEUE = 1;
 }
 
 // === Get shard account ===

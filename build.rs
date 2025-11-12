@@ -9,6 +9,7 @@ fn main() -> Result<()> {
         .bytes(".indexer.LibraryCellFound.cell")
         .bytes(".indexer.LibraryCellsBatchEntry.cell")
         .bytes(".indexer.BlockChunk.data")
+        .bytes(".indexer.PersistentStateChunk.data")
         .bytes(".indexer.ShardAccount.accountState")
         .bytes(".indexer.ShardAccount.proof")
         .bytes(".indexer.SendMessageRequest.message")
