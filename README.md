@@ -46,6 +46,26 @@ pip install -r ./scripts/requirements.txt
 python ./scripts/gen-dashboard.py > dashboard.json
 ```
 
+## How to sync from S3
+
+The node can pull archives not only from the blockchain, but also from a custom S3 bucket. To use this feature, you need to specify the S3 client settings in the config:
+
+```bash
+{
+  ...
+  "s3_client": {
+    "region": "europe-west1",
+    "endpoint": "https://storage.googleapis.com",
+    "bucket": "your-archives-bucket",
+    "credentials": {
+      "access_key": "GOOG1EACCESSKEY123",
+      "secret_key": "verySecretKey"
+    }
+  }
+  ...
+}
+```
+
 ## Contributing
 
 We welcome contributions to the project! If you notice any issues or errors,
