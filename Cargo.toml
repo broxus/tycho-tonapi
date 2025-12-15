@@ -1,6 +1,6 @@
 [package]
 name = "tycho-tonapi"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.89.0"
 
@@ -38,10 +38,10 @@ tycho-types = { version = "0.3.0", features = ["sync", "base64", "models", "tych
 tycho-util = { version = "0.3.4", features = ["cli"] }
 
 [patch.crates-io]
-tycho-block-util = { git = "https://github.com/broxus/tycho.git", rev = "f541531d0b38d21922cbb01ac372432459277959" }
-tycho-core = { git = "https://github.com/broxus/tycho.git", rev = "f541531d0b38d21922cbb01ac372432459277959" }
-tycho-storage = { git = "https://github.com/broxus/tycho.git", rev = "f541531d0b38d21922cbb01ac372432459277959" }
-tycho-util = { git = "https://github.com/broxus/tycho.git", rev = "f541531d0b38d21922cbb01ac372432459277959" }
+tycho-block-util = { git = "https://github.com/broxus/tycho.git", rev = "1a5f1a0e24d231ea6485f27b94f71d857f9bcfda" }
+tycho-core = { git = "https://github.com/broxus/tycho.git", rev = "1a5f1a0e24d231ea6485f27b94f71d857f9bcfda" }
+tycho-storage = { git = "https://github.com/broxus/tycho.git", rev = "1a5f1a0e24d231ea6485f27b94f71d857f9bcfda" }
+tycho-util = { git = "https://github.com/broxus/tycho.git", rev = "1a5f1a0e24d231ea6485f27b94f71d857f9bcfda" }
 
 [build-dependencies]
 anyhow = "1"

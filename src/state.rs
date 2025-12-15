@@ -92,12 +92,9 @@ pub struct AppStateConfig {
 }
 
 impl AppStateConfig {
-    pub fn modify_core_storage_config(
-        &self,
-        config: &mut tycho_core::storage::CoreStorageConfig,
-    ) -> Result<()> {
+    pub fn modify_base_config(&self, config: &mut tycho_core::node::NodeBaseConfig) -> Result<()> {
         if let Some(backpressure_mode) = &self.backpressure_mode
-            && let Some(blocks_gc) = &mut config.blocks_gc
+            && let Some(blocks_gc) = &mut config.core_storage.blocks_gc
         {
             match &mut blocks_gc.ty {
                 BlocksGcType::BeforeSafeDistance { safe_distance, .. } => {

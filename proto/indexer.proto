@@ -18,7 +18,7 @@ service TychoIndexer {
     rpc GetLibraryCells (GetLibraryCellsRequest) returns (GetLibraryCellsResponse);
     // Send message to validators.
     rpc SendMessage (SendMessageRequest) returns (SendMessageResponse);
-    // Notify the node that is can proceed further
+    // Notify the node that it can proceed further
     rpc Ack (AckRequest) returns (AckResponse);
 }
 
@@ -115,7 +115,7 @@ message GetBlockRequest {
         BlockById byId = 2;
     }
     // A masterchain seqno of the latest processed blocks edge.
-    // Use this to notify the node that is can proceed further,
+    // Use this to notify the node that it can proceed further,
     // when backpressure mode is enabled.
     optional uint32 ackMcSeqno = 3;
 }
