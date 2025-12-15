@@ -107,11 +107,16 @@ impl Cmd {
             .block_on(cli::signal::run_or_terminate(self.run_impl(node_config)))
     }
 
-    async fn run_impl(self, node_config: NodeConfig) -> Result<()> {
+    async fn run_impl(self, mut node_config: NodeConfig) -> Result<()> {
         if let Some(metrics) = &node_config.metrics {
             // TODO: Make `async` or remove a tokio dependency from it.
             tycho_util::cli::metrics::init_metrics(metrics)?;
         }
+
+        // Normalize config.
+        node_config
+            .app
+            .modify_core_storage_config(&mut node_config.base.core_storage)?;
 
         // Build node.
         let keys = NodeKeys::load_or_create(self.keys.unwrap())?;
@@ -158,6 +163,7 @@ impl Cmd {
             .init(&init_block_id)
             .await
             .context("failed to init app state")?;
+        let backpressure = state.backpressure();
 
         // Build strider.
         let archive_block_provider = node.build_archive_block_provider();
@@ -176,6 +182,7 @@ impl Cmd {
                 node.validator_resolver().clone(),
                 MetricsSubscriber,
             )
+                .chain(backpressure)
                 .chain(gc_subscriber),
         );
 

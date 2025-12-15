@@ -84,6 +84,39 @@ pub struct AppStateConfig {
     /// Default: `1 min`
     #[serde(with = "serde_helpers::humantime")]
     pub gc_interval: Duration,
+
+    /// Node sync speed limiter.
+    ///
+    /// Default: `None`
+    pub backpressure_mode: Option<BackpressureMode>,
+}
+
+impl AppStateConfig {
+    pub fn modify_core_storage_config(
+        &self,
+        config: &mut tycho_core::storage::CoreStorageConfig,
+    ) -> Result<()> {
+        if let Some(backpressure_mode) = &self.backpressure_mode
+            && let Some(blocks_gc) = &mut config.blocks_gc
+        {
+            match &mut blocks_gc.ty {
+                BlocksGcType::BeforeSafeDistance { safe_distance, .. } => {
+                    *safe_distance = std::cmp::max(
+                        *safe_distance,
+                        backpressure_mode.prefetch_distance.saturating_add(1),
+                    );
+                }
+                BlocksGcType::BeforePreviousKeyBlock
+                | BlocksGcType::BeforePreviousPersistentState => {
+                    anyhow::bail!(
+                        "backpressure mode can only be enabled when \
+                        `core_storage.blocks_gc.type` is `BeforeSafeDistance`"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for AppStateConfig {
@@ -97,8 +130,15 @@ impl Default for AppStateConfig {
             events_buffer_size: 50,
             states_tail_len: NonZeroUsize::new(3).unwrap(),
             gc_interval: Duration::from_secs(60),
+            backpressure_mode: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BackpressureMode {
+    /// How many masterchain blocks ahead can a node prefetch.
+    pub prefetch_distance: u32,
 }
 
 #[derive(Clone)]
@@ -126,6 +166,12 @@ impl AppState {
         };
 
         let db = storage.context().open_preconfigured(TonApiTables::NAME)?;
+
+        let backpressure_state = config.backpressure_mode.map(|mode| BackpressureState {
+            prefetch_distance: mode.prefetch_distance,
+            seqno: watch::channel(0).0,
+            update_mutex: Default::default(),
+        });
 
         let (new_mc_block_events, _) = watch::channel(None);
 
@@ -163,12 +209,21 @@ impl AppState {
                 gc_interval: config.gc_interval,
                 gc_task_handle: Default::default(),
                 config,
+                backpressure_state,
             }),
         })
     }
 
+    pub fn backpressure(&self) -> BackpressureSubscriber {
+        BackpressureSubscriber {
+            inner: self.inner.clone(),
+        }
+    }
+
     pub async fn init(&self, latest_block_id: &BlockId) -> Result<()> {
         let this = self.inner.as_ref();
+
+        self.init_backpressure(latest_block_id.seqno)?;
 
         // Preload latest states
         let ref_by_mc_seqno = latest_block_id.seqno;
@@ -269,6 +324,48 @@ impl AppState {
         Ok(())
     }
 
+    fn init_backpressure(&self, latest_seqno: u32) -> Result<()> {
+        // Init backpressure state if needed
+        if let Some(backpressure_state) = &self.inner.backpressure_state {
+            let seqno = match self.inner.load_backpressure_seqno()? {
+                Some(seqno) => {
+                    anyhow::ensure!(
+                        seqno <= latest_seqno,
+                        "restored initial backpressure seqno is in future: \
+                        restored={seqno}, latest={latest_seqno}",
+                    );
+
+                    let min_possible_seqno =
+                        latest_seqno.saturating_sub(backpressure_state.prefetch_distance);
+                    anyhow::ensure!(
+                        seqno >= min_possible_seqno,
+                        "restored initial backpressure seqno is outside of the prefetch window, \
+                        restored={seqno}, min_possible_seqno={min_possible_seqno}",
+                    );
+
+                    seqno
+                }
+                None => {
+                    self.inner.store_backpressure_seqno(Some(latest_seqno))?;
+                    tracing::warn!(seqno = latest_seqno, "updated initial backpressure seqno");
+                    latest_seqno
+                }
+            };
+
+            tracing::info!(seqno, "computed initial backpressure seqno");
+            backpressure_state.seqno.send_replace(seqno);
+        } else {
+            if let Some(seqno) = self.inner.load_backpressure_seqno()? {
+                tracing::warn!(seqno, "removed backpressure seqno");
+            }
+
+            // Remove backpressure seqno if disabled so that.
+            self.inner.store_backpressure_seqno(None)?;
+        }
+
+        Ok(())
+    }
+
     pub fn config(&self) -> &AppStateConfig {
         &self.inner.config
     }
@@ -287,11 +384,63 @@ impl AppState {
             timestamp: tycho_util::time::now_millis(),
             zerostate_id: this.zerostate_id,
             init_block_seqno: this.init_block_seqno.load(Ordering::Acquire),
+            ack_mc_seqno: this
+                .backpressure_state
+                .as_ref()
+                .map(|state| *state.seqno.borrow()),
         }
     }
 
     pub fn is_ready(&self) -> bool {
         self.inner.is_ready()
+    }
+
+    pub async fn update_backpressure_seqno(&self, seqno: u32) -> StateResult<Option<u32>> {
+        // Allow setting a seqno from a bit in future just in case of some data races.
+        const STRANGE_OFFSET: u32 = 1;
+
+        let this = self.inner.as_ref();
+
+        let mc_state_info = this.load_mc_state_info()?;
+        if seqno > mc_state_info.mc_seqno.saturating_add(STRANGE_OFFSET) {
+            return Err(StateError::InvalidData(anyhow::anyhow!(
+                "cannot set backpressure seqno from the future"
+            )));
+        }
+
+        let ack_seqno = match &this.backpressure_state {
+            Some(state) => 'seqno: {
+                // Fast check if `seqno` was already processed.
+                let ack_seqno = *state.seqno.borrow();
+                if seqno <= ack_seqno {
+                    break 'seqno Some(ack_seqno);
+                }
+
+                let _guard = state.update_mutex.lock().await;
+
+                // Check once more since it could have updated while waiting for the guard.
+                let ack_seqno = *state.seqno.borrow();
+                if seqno <= ack_seqno {
+                    break 'seqno Some(ack_seqno);
+                }
+
+                // Save the value and notify subscribers.
+                this.store_backpressure_seqno(Some(seqno))
+                    .map_err(StateError::Internal)?;
+                state.seqno.send_modify(|old| {
+                    // NOTE: This is the only place where we update the listener,
+                    // so all previous checks in this method should have returned
+                    // early if the stored value is less or equal to old.
+                    debug_assert!(*old < seqno);
+                    *old = seqno;
+                });
+
+                Some(seqno)
+            }
+            None => None,
+        };
+
+        Ok(WithMcStateInfo::new(mc_state_info, ack_seqno))
     }
 
     pub async fn watch_new_blocks(&self, since_mc_seqno: u32) -> StateResult<NewBlocksStream> {
@@ -1017,6 +1166,7 @@ struct Inner {
     gc_seqno_offset: u32,
     gc_interval: Duration,
     gc_task_handle: Mutex<Option<AbortHandle>>,
+    backpressure_state: Option<BackpressureState>,
 }
 
 impl Inner {
@@ -1272,6 +1422,24 @@ impl Inner {
 
         Ok(OldEvent::NotFound(snapshot))
     }
+
+    fn load_backpressure_seqno(&self) -> Result<Option<u32>> {
+        let Some(value) = self.db.state.get(BACKPRESSURE_SEQNO_KEY)? else {
+            return Ok(None);
+        };
+        let value = value.as_ref();
+        anyhow::ensure!(value.len() == 4, "invalid stored backpressure seqno");
+        Ok(Some(u32::from_le_bytes(value.try_into().unwrap())))
+    }
+
+    fn store_backpressure_seqno(&self, seqno: Option<u32>) -> Result<()> {
+        let state = &self.db.state;
+        match seqno {
+            Some(seqno) => state.insert(BACKPRESSURE_SEQNO_KEY, seqno.to_le_bytes()),
+            None => self.db.state.remove(BACKPRESSURE_SEQNO_KEY),
+        }
+        .map_err(Into::into)
+    }
 }
 
 impl Drop for Inner {
@@ -1281,6 +1449,77 @@ impl Drop for Inner {
         }
     }
 }
+
+pub struct BackpressureSubscriber {
+    inner: Arc<Inner>,
+}
+
+impl BlockSubscriber for BackpressureSubscriber {
+    type Prepared = ();
+    type PrepareBlockFut<'a> = futures_util::future::Ready<Result<Self::Prepared>>;
+    type HandleBlockFut<'a> = BoxFuture<'a, Result<()>>;
+
+    fn prepare_block<'a>(&'a self, _: &'a BlockSubscriberContext) -> Self::PrepareBlockFut<'a> {
+        futures_util::future::ready(Ok(()))
+    }
+
+    fn handle_block<'a>(
+        &'a self,
+        cx: &'a BlockSubscriberContext,
+        _: Self::Prepared,
+    ) -> Self::HandleBlockFut<'a> {
+        Box::pin(async move {
+            let Some(state) = &self.inner.backpressure_state else {
+                return Ok(());
+            };
+
+            let block_id = cx.block.id();
+            if !block_id.is_masterchain() {
+                return Ok(());
+            }
+
+            let min_seqno = block_id.seqno.saturating_sub(state.prefetch_distance);
+
+            let mut processed_seqno = state.seqno.subscribe();
+            let mut was_stuck = false;
+
+            // Wait until the backpressure seqno is at least `min_seqno`.
+            let seqno = loop {
+                let ack_seqno = *processed_seqno.borrow_and_update();
+                if ack_seqno >= min_seqno {
+                    break ack_seqno;
+                }
+
+                // Print log message once.
+                if !was_stuck {
+                    tracing::info!(
+                        seqno = ack_seqno,
+                        min_seqno,
+                        latest_seqno = cx.block.id().seqno,
+                        "node is too far ahead of the backpressure seqno"
+                    );
+                    was_stuck = true;
+                }
+
+                processed_seqno.changed().await?;
+            };
+
+            if was_stuck {
+                tracing::info!(seqno, "backpressure seqno reached the prefetch window");
+            }
+
+            Ok(())
+        })
+    }
+}
+
+struct BackpressureState {
+    prefetch_distance: u32,
+    seqno: watch::Sender<u32>,
+    update_mutex: tokio::sync::Mutex<()>,
+}
+
+const BACKPRESSURE_SEQNO_KEY: &[u8] = b"tonapi_bp_seqno";
 
 enum OldEvent {
     Found(Arc<NewMasterchainBlock>),
@@ -1433,6 +1672,7 @@ pub struct AppStatus {
     pub timestamp: u64,
     pub zerostate_id: ZerostateId,
     pub init_block_seqno: u32,
+    pub ack_mc_seqno: Option<u32>,
 }
 
 pub struct AccessedShardAccount {

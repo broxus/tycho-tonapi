@@ -18,6 +18,8 @@ service TychoIndexer {
     rpc GetLibraryCells (GetLibraryCellsRequest) returns (GetLibraryCellsResponse);
     // Send message to validators.
     rpc SendMessage (SendMessageRequest) returns (SendMessageResponse);
+    // Notify the node that is can proceed further
+    rpc Ack (AckRequest) returns (AckResponse);
 }
 
 // === Get status ===
@@ -38,6 +40,22 @@ message GetStatusResponse {
     uint32 initBlockSeqno = 5;
     // Node version (encoded as octets, e.g. version 1.2.3 will be 0x00010203)
     uint32 version = 6;
+    // Current backpressure mode seqno (if enabled).
+    optional uint32 ackMcSeqno = 7;
+}
+
+// === Ack ===
+
+message AckRequest {
+    // A masterchain seqno of the latest processed blocks edge.
+    uint32 mcSeqno = 1;
+}
+
+message AckResponse {
+    // Brief masterchain info at the moment of accessing the state.
+    McStateInfo mcStateInfo = 1;
+    // Current backpressure mode seqno (if enabled).
+    optional uint32 ackMcSeqno = 2;
 }
 
 // === Watch block ids ===
@@ -96,6 +114,10 @@ message GetBlockRequest {
         // Searches for a block by its id.
         BlockById byId = 2;
     }
+    // A masterchain seqno of the latest processed blocks edge.
+    // Use this to notify the node that is can proceed further,
+    // when backpressure mode is enabled.
+    optional uint32 ackMcSeqno = 3;
 }
 
 message GetBlockResponse {

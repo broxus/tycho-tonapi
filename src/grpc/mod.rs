@@ -88,6 +88,22 @@ impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
             zerostate_file_hash: status.zerostate_id.file_hash.as_slice().to_vec(),
             init_block_seqno: status.init_block_seqno,
             version: crate::version_packed(),
+            ack_mc_seqno: status.ack_mc_seqno,
+        }))
+    }
+
+    async fn ack(
+        &self,
+        request: tonic::Request<proto::AckRequest>,
+    ) -> tonic::Result<tonic::Response<proto::AckResponse>> {
+        let res = self
+            .state
+            .update_backpressure_seqno(request.get_ref().mc_seqno)
+            .await?;
+
+        Ok(tonic::Response::new(proto::AckResponse {
+            mc_state_info: Some(res.mc_state_info.into()),
+            ack_mc_seqno: res.data,
         }))
     }
 
@@ -120,6 +136,11 @@ impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
             }),
             ProtoQueryBlock::ById(q) => QueryBlock::ById(q.id.require()?.try_into()?),
         };
+
+        if let Some(ack_seqno) = request.get_ref().ack_mc_seqno {
+            self.state.update_backpressure_seqno(ack_seqno).await?;
+        }
+
         let res = self.state.get_block(&query).await?;
 
         Ok(tonic::Response::new(match res.data {
