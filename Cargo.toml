@@ -1,6 +1,6 @@
 [package]
 name = "tycho-tonapi"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 rust-version = "1.89.0"
 
@@ -31,17 +31,14 @@ tikv-jemallocator = { version = "0.6.0", features = [
     "profiling",
 ] }
 
-tycho-block-util = { version = "0.3.4" }
-tycho-core = { version = "0.3.4", features = ["cli"] }
-tycho-storage = { version = "0.3.4" }
-tycho-types = { version = "0.3.0", features = ["sync", "base64", "models", "tycho", "rand9"] }
-tycho-util = { version = "0.3.4", features = ["cli"] }
+tycho-block-util = { version = "0.3.6" }
+tycho-core = { version = "0.3.6", features = ["cli"] }
+tycho-storage = { version = "0.3.6" }
+tycho-types = { version = "0.3.2", features = ["sync", "base64", "models", "tycho", "rand9"] }
+tycho-util = { version = "0.3.6", features = ["cli"] }
 
 [patch.crates-io]
-tycho-block-util = { git = "https://github.com/broxus/tycho.git", rev = "1a5f1a0e24d231ea6485f27b94f71d857f9bcfda" }
-tycho-core = { git = "https://github.com/broxus/tycho.git", rev = "1a5f1a0e24d231ea6485f27b94f71d857f9bcfda" }
-tycho-storage = { git = "https://github.com/broxus/tycho.git", rev = "1a5f1a0e24d231ea6485f27b94f71d857f9bcfda" }
-tycho-util = { git = "https://github.com/broxus/tycho.git", rev = "1a5f1a0e24d231ea6485f27b94f71d857f9bcfda" }
+# patches here
 
 [build-dependencies]
 anyhow = "1"
