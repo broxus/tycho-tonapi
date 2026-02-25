@@ -9,7 +9,7 @@ use tokio_stream::Stream;
 use tycho_types::cell::HashBytes;
 use tycho_types::models::{BlockIdShort, ShardIdent, StdAddr};
 
-use crate::state::{AppState, StateError};
+use crate::state::{AppState, SendMessageResult, StateError, ValidationError};
 
 pub mod proto {
     tonic::include_proto!("indexer");
@@ -260,13 +260,19 @@ impl proto::tycho_indexer_server::TychoIndexer for GrpcServer {
         &self,
         request: tonic::Request<proto::SendMessageRequest>,
     ) -> tonic::Result<tonic::Response<proto::SendMessageResponse>> {
-        let delivered_to = self
-            .state
-            .send_message(request.into_inner().message)
-            .await?;
+        let req = request.into_inner();
 
-        Ok(tonic::Response::new(proto::SendMessageResponse {
-            delivered_to: delivered_to as u32,
+        let result = self.state.send_message(req.message, req.validate).await?;
+
+        Ok(tonic::Response::new(match result {
+            SendMessageResult::Success(count) => proto::SendMessageResponse {
+                delivered_to: count as u32,
+                validation_error: None,
+            },
+            SendMessageResult::Rejected(err) => proto::SendMessageResponse {
+                delivered_to: 0,
+                validation_error: Some(err.into()),
+            },
         }))
     }
 }
@@ -524,5 +530,24 @@ impl TryFrom<&proto::BlockId> for tycho_types::models::BlockId {
             root_hash: *parse_hash_ref(&value.root_hash)?,
             file_hash: *parse_hash_ref(&value.file_hash)?,
         })
+    }
+}
+
+impl From<ValidationError> for proto::ValidationError {
+    fn from(value: ValidationError) -> Self {
+        use proto::ValidationErrorCode;
+
+        let (code, exit_code) = match value {
+            ValidationError::NodeNotReady => (ValidationErrorCode::NodeNotReady, None),
+            ValidationError::InvalidMessage => (ValidationErrorCode::InvalidMessage, None),
+            ValidationError::AccountNotFound => (ValidationErrorCode::AccountNotFound, None),
+            ValidationError::NotAccepted { exit_code } => {
+                (ValidationErrorCode::NotAccepted, Some(exit_code))
+            }
+        };
+        Self {
+            code: code as i32,
+            exit_code,
+        }
     }
 }

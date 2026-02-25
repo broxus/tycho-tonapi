@@ -251,6 +251,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "812e12b5285cc515a9c72a5c1d3b6d46a19dac5acfef5265968c166106e31dd3"
 
 [[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "blake3"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -613,6 +622,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "darling"
+version = "0.21.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cdf337090841a411e2a7f3deb9187445851f91b309c0c0a29e05f74a00a48c0"
+dependencies = [
+ "darling_core",
+ "darling_macro",
+]
+
+[[package]]
+name = "darling_core"
+version = "0.21.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1247195ecd7e3c85f83c8d2a366e4210d588e802133e1e355180a9870b517ea4"
+dependencies = [
+ "fnv",
+ "ident_case",
+ "proc-macro2",
+ "quote",
+ "strsim",
+ "syn",
+]
+
+[[package]]
+name = "darling_macro"
+version = "0.21.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d38308df82d1080de0afee5d069fa14b0326a88c14f15c5ccda35b4a6c414c81"
+dependencies = [
+ "darling_core",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "dashmap"
 version = "6.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -659,6 +703,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -677,6 +722,12 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "dyn-clone"
+version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "ed25519"
@@ -1291,6 +1342,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ident_case"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
+
+[[package]]
 name = "idna"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1660,10 +1717,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-bigint"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf97ec579c3c42f953ef76dbf8d55ac91fb219dde70e49aa4a6b7d74e9919050"
+
+[[package]]
+name = "num-integer"
+version = "0.1.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
+dependencies = [
+ "num-traits",
+]
 
 [[package]]
 name = "num-traits"
@@ -3282,6 +3358,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tycho-executor"
+version = "0.3.3"
+source = "git+https://github.com/broxus/tycho-vm.git?rev=2122324cd6df354947373fb416537c59418eb91d#2122324cd6df354947373fb416537c59418eb91d"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "num-bigint",
+ "thiserror 2.0.18",
+ "tycho-types",
+ "tycho-vm",
+]
+
+[[package]]
 name = "tycho-network"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3383,9 +3472,11 @@ dependencies = [
  "tracing",
  "tycho-block-util",
  "tycho-core",
+ "tycho-executor",
  "tycho-storage",
  "tycho-types",
  "tycho-util",
+ "tycho-vm",
  "weedb",
 ]
 
@@ -3402,6 +3493,8 @@ dependencies = [
  "crc32c",
  "dashmap",
  "hex",
+ "num-bigint",
+ "num-traits",
  "rand",
  "rayon",
  "scc",
@@ -3474,6 +3567,38 @@ version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "723c91dccdb15a705b0448705f631c6e32298931013c054e54f6ffd9cb592341"
 dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "tycho-vm"
+version = "0.3.3"
+source = "git+https://github.com/broxus/tycho-vm.git?rev=2122324cd6df354947373fb416537c59418eb91d#2122324cd6df354947373fb416537c59418eb91d"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "bitflags",
+ "blake2",
+ "dyn-clone",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "sha2",
+ "thiserror 2.0.18",
+ "tl-proto",
+ "tycho-crypto",
+ "tycho-types",
+ "tycho-vm-proc",
+]
+
+[[package]]
+name = "tycho-vm-proc"
+version = "0.3.3"
+source = "git+https://github.com/broxus/tycho-vm.git?rev=2122324cd6df354947373fb416537c59418eb91d#2122324cd6df354947373fb416537c59418eb91d"
+dependencies = [
+ "darling",
  "proc-macro2",
  "quote",
  "syn",
