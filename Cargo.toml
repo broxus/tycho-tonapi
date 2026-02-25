@@ -37,8 +37,13 @@ tycho-storage = { version = "0.3.6" }
 tycho-types = { version = "0.3.2", features = ["sync", "base64", "models", "tycho", "rand9"] }
 tycho-util = { version = "0.3.6", features = ["cli"] }
 
+tycho-executor = "0.3.3"
+tycho-vm = "0.3.3"
+
 [patch.crates-io]
 # patches here
+tycho-executor = { git = "https://github.com/broxus/tycho-vm.git", rev = "2122324cd6df354947373fb416537c59418eb91d" }
+tycho-vm = { git = "https://github.com/broxus/tycho-vm.git", rev = "2122324cd6df354947373fb416537c59418eb91d" }
 
 [build-dependencies]
 anyhow = "1"

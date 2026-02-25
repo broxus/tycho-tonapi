@@ -255,11 +255,32 @@ message LibraryCellsBatchEntry {
 message SendMessageRequest {
     // BOC-encoded `Message`.
     bytes message = 1;
+    // Validate `Message` before broadcast.
+    bool validate = 2;
 }
 
 message SendMessageResponse {
     // Number of nodes this message was successfully delivered to.
     uint32 deliveredTo = 1;
+    // The message is NOT broadcast if this field is set.
+    optional ValidationError validationError = 2;
+}
+
+enum ValidationErrorCode {
+    // Node is not yet initialized — state not available.
+    NODE_NOT_READY = 0;
+    // Message failed to parse.
+    INVALID_MESSAGE = 1;
+    // Account not found in the current state.
+    ACCOUNT_NOT_FOUND = 2;
+    // Message not accepted.
+    NOT_ACCEPTED = 3;
+}
+
+message ValidationError {
+    ValidationErrorCode code = 1;
+    // TVM exit code. Present only when code = NOT_ACCEPTED.
+    optional int32 exitCode = 2;
 }
 
 // === Common stuff ===

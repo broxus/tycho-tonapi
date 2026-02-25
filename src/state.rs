@@ -19,17 +19,18 @@ use tokio::task::AbortHandle;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
-use tycho_block_util::message::validate_external_message;
+use tycho_block_util::message::parse_external_message;
 use tycho_block_util::state::ShardStateStuff;
 use tycho_core::block_strider::{BlockSubscriber, BlockSubscriberContext, StateSubscriber};
 use tycho_core::blockchain_rpc::BlockchainRpcClient;
 use tycho_core::global_config::ZerostateId;
 use tycho_core::storage::{BlocksGcConfig, BlocksGcType, CoreStorage};
+use tycho_executor::{Executor, ExecutorInspector, ExecutorParams, ParsedConfig, TxError};
 use tycho_storage::kv::NamedTables;
 use tycho_types::merkle::MerkleProofBuilder;
 use tycho_types::models::{
-    Block, BlockId, BlockIdShort, DepthBalanceInfo, LibDescr, McBlockExtra, ShardAccount,
-    ShardIdent, ShardStateUnsplit, StdAddr,
+    Block, BlockId, BlockIdShort, DepthBalanceInfo, GlobalCapability, IntAddr, LibDescr,
+    McBlockExtra, MsgInfo, ShardAccount, ShardIdent, ShardStateUnsplit, StdAddr,
 };
 use tycho_types::prelude::*;
 use tycho_util::mem::Reclaimer;
@@ -252,9 +253,15 @@ impl AppState {
             .write()
             .push(mc_state.clone(), shard_states.values().cloned().collect());
 
+        let parsed_config = Arc::new(ParsedConfig::parse(
+            mc_state.state.config_params()?.clone(),
+            mc_state.mc_state_info.utime,
+        )?);
+
         this.latest_states.store(Some(Arc::new(LatestStates {
             mc_state,
             shard_states,
+            parsed_config,
         })));
 
         // Preload init block seqno
@@ -898,12 +905,122 @@ impl AppState {
         Ok(WithMcStateInfo::new(state.mc_state_info, result))
     }
 
-    pub async fn send_message(&self, message: Bytes) -> Result<usize, StateError> {
-        if let Err(e) = validate_external_message(&message).await {
-            return Err(StateError::InvalidData(e.into()));
+    pub async fn send_message(
+        &self,
+        message: Bytes,
+        validate: bool,
+    ) -> Result<SendMessageResult, StateError> {
+        // Validate BOC format and get root cell.
+        let msg_cell = parse_external_message(&message)
+            .await
+            .map_err(|e| StateError::InvalidData(e.into()))?;
+
+        if validate {
+            // Check whether the contract would accept the message.
+            if let Some(err) = self.check_external_message(msg_cell).await? {
+                return Ok(SendMessageResult::Rejected(err));
+            }
         }
 
-        Ok(self.inner.client.broadcast_external_message(&message).await)
+        let count = self.inner.client.broadcast_external_message(&message).await;
+        Ok(SendMessageResult::Success(count))
+    }
+
+    async fn check_external_message(
+        &self,
+        msg_cell: Cell,
+    ) -> Result<Option<ValidationError>, StateError> {
+        let Some(latest) = self.inner.latest_states.load_full() else {
+            return Ok(Some(ValidationError::NodeNotReady));
+        };
+
+        // Extract destination address from the message.
+        let dst = {
+            let mut slice = msg_cell.as_slice_allow_exotic();
+
+            let Ok(MsgInfo::ExtIn(info)) = MsgInfo::load_from(&mut slice) else {
+                return Ok(Some(ValidationError::InvalidMessage));
+            };
+
+            let IntAddr::Std(dst) = info.dst else {
+                return Ok(Some(ValidationError::InvalidMessage));
+            };
+
+            if dst.anycast.is_none() {
+                return Ok(Some(ValidationError::InvalidMessage));
+            }
+
+            dst
+        };
+
+        // Find the shard state containing this account.
+        let Some(state) = latest.find_state_for_address(&dst) else {
+            return Ok(Some(ValidationError::AccountNotFound));
+        };
+
+        // Get the current account state.
+        let shard_account = match state.accounts.get(dst.address) {
+            Ok(Some((_, sa))) => sa,
+            Ok(None) => return Ok(Some(ValidationError::AccountNotFound)),
+            Err(e) => return Err(StateError::Internal(e.into())),
+        };
+
+        let libraries = latest.mc_state.libraries.clone();
+        let prev_mc_block_id = *latest.mc_state.state.block_id();
+        let block_lt = state.mc_state_info.lt;
+        let ref_mc_handle = state.state.ref_mc_state_handle().clone();
+
+        let parsed_config = latest.parsed_config.clone();
+
+        drop(latest);
+
+        tycho_util::sync::rayon_run(move || {
+            let _guard = ref_mc_handle;
+
+            let global_id = parsed_config.global_id;
+
+            let global = parsed_config.global;
+            let capabilities = global.capabilities;
+
+            let rand_seed = HashBytes::ZERO;
+            let block_unixtime = tycho_util::time::now_sec();
+
+            let params = ExecutorParams {
+                libraries,
+                rand_seed,
+                block_lt,
+                block_unixtime,
+                prev_mc_block_id: Some(prev_mc_block_id),
+                disable_delete_frozen_accounts: true,
+                full_body_in_bounced: capabilities.contains(GlobalCapability::CapFullBodyInBounced),
+                charge_action_fees_on_fail: true,
+                strict_extra_currency: true,
+                authority_marks_enabled: capabilities.contains(GlobalCapability::CapSuspendByMarks),
+                vm_modifiers: tycho_vm::BehaviourModifiers {
+                    signature_with_id: capabilities
+                        .contains(GlobalCapability::CapSignatureWithId)
+                        .then_some(global_id),
+                    enable_signature_domains: capabilities
+                        .contains(GlobalCapability::CapSignatureDomain),
+                    ..Default::default()
+                },
+            };
+
+            let executor = Executor::new(&params, &parsed_config);
+            let mut inspector = ExecutorInspector::default();
+            match executor.check_ordinary_ext(&dst, msg_cell, &shard_account, Some(&mut inspector))
+            {
+                Ok(()) => Ok(None),
+                Err(TxError::Skipped) | Err(TxError::Fatal(_)) => {
+                    let err = match inspector.exit_code {
+                        None => ValidationError::InvalidMessage,
+                        Some(exit_code) => ValidationError::NotAccepted { exit_code },
+                    };
+                    Ok(Some(err))
+                }
+            }
+        })
+        .await
     }
 
     // ===
@@ -1117,6 +1234,11 @@ impl StateSubscriber for AppState {
                 .push(mc_state.clone(), new_shard_states.clone());
 
             // Update the latest states
+            let parsed_config = Arc::new(ParsedConfig::parse(
+                mc_state.state.config_params()?.clone(),
+                mc_state.mc_state_info.utime,
+            )?);
+
             this.latest_states.store(Some(Arc::new(LatestStates {
                 mc_state: mc_state.clone(),
                 // FIXME: Assumes that there is only one base shard for now.
@@ -1126,6 +1248,7 @@ impl StateSubscriber for AppState {
                         FastHashMap::from_iter([(shard.state.block_id().shard, shard.clone())])
                     }
                 },
+                parsed_config,
             })));
 
             // Send event
@@ -1526,6 +1649,7 @@ enum OldEvent {
 struct LatestStates {
     mc_state: Arc<CachedState>,
     shard_states: FastHashMap<ShardIdent, Arc<CachedState>>,
+    parsed_config: Arc<ParsedConfig>,
 }
 
 impl LatestStates {
@@ -1820,6 +1944,26 @@ fn make_state_root_proof(block_root: &Cell) -> Result<Cell, tycho_types::error::
 }
 
 pub type StateResult<T> = Result<WithMcStateInfo<T>, StateError>;
+
+#[derive(Debug, Clone)]
+pub enum SendMessageResult {
+    /// Message was broadcast to `n` validators.
+    Success(usize),
+    /// Contract rejected the message during execution.
+    Rejected(ValidationError),
+}
+
+#[derive(Debug, Clone)]
+pub enum ValidationError {
+    /// Node is not yet initialized — state not available.
+    NodeNotReady,
+    /// Message failed to parse.
+    InvalidMessage,
+    /// Account not found in the current state.
+    AccountNotFound,
+    /// Message not accepted during validation.
+    NotAccepted { exit_code: i32 },
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
