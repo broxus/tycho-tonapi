@@ -1,28 +1,28 @@
 [package]
 name = "tycho-tonapi"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
-rust-version = "1.89.0"
+rust-version = "1.95.0"
 
 [dependencies]
 anyhow = "1"
-arc-swap = "1.7.1"
-bytes = "1.10.1"
-bytesize = { version = "2.1.0", features = ["serde"] }
-clap = { version = "4.5.48", features = ["derive"] }
-futures-util = "0.3.31"
-humantime = "2.3.0"
+arc-swap = "1.9.2"
+bytes = "1.12.0"
+bytesize = { version = "2.4.2", features = ["serde"] }
+clap = { version = "4.5.55", features = ["derive"] }
+futures-util = "0.3.32"
+humantime = "2.4.0"
 moka = { version = "0.12", features = ["sync"] }
 parking_lot = "0.12.5"
-prost = "0.14.1"
+prost = "0.14.4"
 scopeguard = "1.2.0"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2.0"
-tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync"] }
-tokio-stream = { version = "0.1.17", features = ["sync"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-stream = { version = "0.1.18", features = ["sync"] }
 tonic = { version = "0.14", features = ["server", "gzip", "deflate", "zstd"] }
-tonic-prost = "0.14.2"
-tracing = "0.1.41"
+tonic-prost = "0.14.6"
+tracing = "0.1.44"
 weedb = "0.6.0"
 
 tikv-jemallocator = { version = "0.6.0", features = [
@@ -31,19 +31,23 @@ tikv-jemallocator = { version = "0.6.0", features = [
     "profiling",
 ] }
 
-tycho-block-util = { version = "0.3.6" }
-tycho-core = { version = "0.3.6", features = ["cli"] }
-tycho-storage = { version = "0.3.6" }
-tycho-types = { version = "0.3.2", features = ["sync", "base64", "models", "tycho", "rand9"] }
-tycho-util = { version = "0.3.6", features = ["cli"] }
+tycho-block-util = { version = "0.3.11" }
+tycho-core = { version = "0.3.11", features = ["cli"] }
+tycho-storage = { version = "0.3.11" }
+tycho-types = { version = "0.3.5", features = [
+    "sync",
+    "base64",
+    "models",
+    "tycho",
+    "rand9",
+] }
+tycho-util = { version = "0.3.11", features = ["cli"] }
 
-tycho-executor = "0.3.3"
-tycho-vm = "0.3.3"
+tycho-executor = "0.3.6"
+tycho-vm = "0.3.6"
 
 [patch.crates-io]
 # patches here
-tycho-executor = { git = "https://github.com/broxus/tycho-vm.git", rev = "2122324cd6df354947373fb416537c59418eb91d" }
-tycho-vm = { git = "https://github.com/broxus/tycho-vm.git", rev = "2122324cd6df354947373fb416537c59418eb91d" }
 
 [build-dependencies]
 anyhow = "1"
